@@ -577,11 +577,18 @@ class ManualController:
                     elif event.type == self._pg.JOYBUTTONDOWN:
                         if event.button == self.BUTTON_ARM_DISARM:
                             with self._lock:
-                                # arm only if throttle is low for safety
-                                if self._rc[2] <= PWM_MIN + THROTTLE_SAFETY_ARM_OFFSET:
-                                    self._rc[AUX_ARM_CH] = AUX_ARM_HIGH if self._rc[AUX_ARM_CH] == AUX_ARM_LOW else AUX_ARM_LOW
+                                # Disarm anytime; Arm only if throttle is low
+                                armed = self._rc[AUX_ARM_CH] >= (AUX_ARM_LOW + AUX_ARM_HIGH) // 2
+                                if armed:
+                                    # Always allow disarm and drop throttle to minimum for safety
+                                    self._rc[AUX_ARM_CH] = AUX_ARM_LOW
+                                    self._rc[2] = PWM_MIN
                                 else:
-                                    print("[MANUAL] Refuse arm: throttle too high")
+                                    # Require throttle low to arm
+                                    if self._rc[2] <= PWM_MIN + THROTTLE_SAFETY_ARM_OFFSET:
+                                        self._rc[AUX_ARM_CH] = AUX_ARM_HIGH
+                                    else:
+                                        print("[MANUAL] Refuse arm: throttle too high")
                         elif event.button == self.BUTTON_ALTHOLD:
                             with self._lock:
                                 # AUX2 high while held
