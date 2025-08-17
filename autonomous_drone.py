@@ -1044,6 +1044,8 @@ def main():
     parser.add_argument('--no-manual', action='store_true', help='Disable gamepad manual override')
     # Telemetry option
     parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (baro raw, bias, ultrasonic, fused, vspeed)')
+    # Calibration option
+    parser.add_argument('--no-calibration', action='store_true', help='Skip startup calibration wait')
 
     args = parser.parse_args()
 
@@ -1083,10 +1085,7 @@ def main():
     telem_stop = threading.Event()
 
     try:
-        # allow some sensor warm-up
-        time.sleep(0.5)
-
-        # Telemetry background thread
+        # Telemetry background thread (start early so we can observe calibration)
         if args.telemetry:
             def _telem_loop():
                 while not telem_stop.is_set():
@@ -1103,6 +1102,17 @@ def main():
             telem_thread = threading.Thread(target=_telem_loop, daemon=True)
             telem_thread.start()
             print("[MAIN] Telemetry enabled")
+
+        # Calibration (default): wait a couple seconds for sensors/bias to settle
+        if not args.no_calibration:
+            wait_s = 2.0
+            print(f"[MAIN] Calibration: waiting {wait_s:.1f}s for sensors to settle (use --no-calibration to skip)")
+            t0 = time.time()
+            while (time.time() - t0) < wait_s:
+                time.sleep(0.1)
+        else:
+            # Minimal warm-up when skipping calibration
+            time.sleep(0.2)
 
         # Commands
         if args.arm:
