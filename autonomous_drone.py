@@ -69,8 +69,9 @@ ULTRA_DEFAULT_ENABLED = True
 # Valid measurement range (meters)
 ULTRA_MIN_VALID_M = 0.02
 ULTRA_MAX_VALID_M = 1.00
+ULTRA_SAT_EPS_M = 0.01  # consider ultrasonic saturated if within this of max
 # Blending region around the top end of ultrasonic range for smooth transition
-# w_ultra = 1 below BLEND_LOW, 0 above BLEND_HIGH, linearly in between
+# w_ultra = 1 below BLEND_LOW, -> 0 as we approach ULTRA_MAX_VALID_M
 ULTRA_BLEND_LOW_M = 0.80
 ULTRA_BLEND_HIGH_M = 1.20
 # Ground calibration: when ultrasonic < this, adapt baro bias toward ultrasonic
@@ -138,7 +139,9 @@ class DroneState:
             # Opportunistic baro bias calibration near ground
             if self.baro_alt_m_raw is not None and self.ultrasonic_alt_m < ULTRA_GROUND_CALIB_M:
                 target_bias = self.baro_alt_m_raw - self.ultrasonic_alt_m
-                self.baro_bias_m = (1.0 - BARO_BIAS_ALPHA) * self.baro_bias_m + BARO_BIAS_ALPHA * target_bias
+                # speed up bias convergence very close to ground where ultrasonic is reliable
+                alpha = 0.15
+                self.baro_bias_m = (1.0 - alpha) * self.baro_bias_m + alpha * target_bias
         else:
             # out of range -> ignore but still fuse using baro
             self.ultrasonic_alt_m = None
@@ -148,23 +151,29 @@ class DroneState:
         self._update_fused(fused, now)
 
     def _fuse_altitude(self, baro_corr: Optional[float], ultra: Optional[float]) -> Optional[float]:
-        # Choose sensor or blend smoothly in top-end of ultrasonic range
+        # Choose sensor or blend with proper handling of ultrasonic saturation
         if baro_corr is None and ultra is None:
             return None
         if ultra is None:
             return baro_corr
         if baro_corr is None:
             return ultra
-        # blending weight based on ultrasonic reading
-        # 1.0 below BLEND_LOW, 0.0 above BLEND_HIGH
         u = float(ultra)
-        if u <= ULTRA_BLEND_LOW_M:
+        # Weight selection:
+        # - Fully trust ultrasonic very close to ground
+        # - If ultrasonic is saturated near its max, rely on baro only
+        # - Otherwise blend down from BLEND_LOW to upper (min of BLEND_HIGH and sensor max)
+        if u <= ULTRA_GROUND_CALIB_M + 0.03:
             w_u = 1.0
-        elif u >= ULTRA_BLEND_HIGH_M:
+        elif u >= ULTRA_MAX_VALID_M - ULTRA_SAT_EPS_M:
             w_u = 0.0
+        elif u <= ULTRA_BLEND_LOW_M:
+            w_u = 1.0
         else:
-            w_u = (ULTRA_BLEND_HIGH_M - u) / (ULTRA_BLEND_HIGH_M - ULTRA_BLEND_LOW_M)
-        return w_u * u + (1.0 - w_u) * float(baro_corr)
+            upper = max(ULTRA_BLEND_LOW_M, min(ULTRA_BLEND_HIGH_M, ULTRA_MAX_VALID_M))
+            w_u = (upper - u) / max(1e-6, (upper - ULTRA_BLEND_LOW_M))
+        fused = w_u * u + (1.0 - w_u) * float(baro_corr)
+        return max(0.0, fused)
 
     def _update_fused(self, fused: Optional[float], now: float):
         if fused is None:
@@ -183,7 +192,7 @@ class DroneState:
             self._altitude_lpf = fused
         else:
             self._altitude_lpf = (1.0 - FUSED_ALT_LPF_ALPHA) * self._altitude_lpf + FUSED_ALT_LPF_ALPHA * fused
-        self.altitude_m = self._altitude_lpf
+        self.altitude_m = max(0.0, self._altitude_lpf)
         self.last_alt_update = now
 
     def set_home_if_needed(self):
@@ -680,6 +689,9 @@ class Autopilot:
         # goto phase
         self._goto_phase: int = 0  # 0=idle, 1=climb, 2=cruise, 3=descend, 4=done
 
+        # landing detection helper
+        self._land_touchdown_start: Optional[float] = None
+
         # altitude control
         self.hover_pwm = 1500
         self.alt_kp = 20.0
@@ -865,22 +877,41 @@ class Autopilot:
 
             elif self.mode == self.MODE_LAND:
                 yaw_cmd = self._yaw_hold_cmd(st)
-                # gentle descend
-                if st.altitude_m is not None:
-                    self.target_alt_m = 0.0
+                # gentle descend toward 0 m
+                self.target_alt_m = 0.0
+                # If we have any altitude estimate, use controller; otherwise slowly reduce throttle
+                if (st.altitude_m is not None) or (st.ultrasonic_alt_m is not None):
                     thr_cmd = self._altitude_cmd(st, landing=True)
-                    roll_cmd = PWM_MID
-                    pitch_cmd = PWM_MID
-                    if st.altitude_m < 0.15:
+                else:
+                    thr_cmd = max(PWM_MIN, self.rc[2] - 5)
+                roll_cmd = PWM_MID
+                pitch_cmd = PWM_MID
+                # touchdown detection with dwell to avoid premature disarm
+                touch = False
+                if st.ultrasonic_alt_m is not None:
+                    # rely on ultrasonic very close to ground (<12 cm)
+                    if st.ultrasonic_alt_m < 0.12:
+                        touch = True
+                elif st.altitude_m is not None:
+                    # fallback: fused altitude extremely low and vertical speed near 0
+                    if st.altitude_m < 0.08 and abs(st._altitude_vspeed_mps) < 0.05:
+                        touch = True
+                now_t = time.time()
+                if touch:
+                    if self._land_touchdown_start is None:
+                        self._land_touchdown_start = now_t
+                        print("[AP] Touchdown detected, confirming...")
+                    elif (now_t - self._land_touchdown_start) > 0.8:
+                        # confirmed landed -> cut throttle and disarm
                         self.rc[2] = PWM_MIN
                         self.msp.send_rc(self._compose_rc(PWM_MID, PWM_MID, PWM_MIN, PWM_MID))
                         time.sleep(0.2)
                         self.disarm()
                         self.mode = self.MODE_IDLE
+                        self._land_touchdown_start = None
                         print("[AP] Landed and disarmed")
                 else:
-                    # no altitude, just cut throttle carefully
-                    thr_cmd = max(PWM_MIN, self.rc[2] - 5)
+                    self._land_touchdown_start = None
 
             # update rc & send
             self.rc = self._compose_rc(roll_cmd, pitch_cmd, thr_cmd, yaw_cmd)
@@ -1011,6 +1042,8 @@ def main():
     parser.add_argument('--ultra-max', type=float, default=1.2, help='Ultrasonic max distance (m)')
     # Manual control options
     parser.add_argument('--no-manual', action='store_true', help='Disable gamepad manual override')
+    # Telemetry option
+    parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (baro raw, bias, ultrasonic, fused, vspeed)')
 
     args = parser.parse_args()
 
@@ -1045,9 +1078,31 @@ def main():
         manual=manual,
     )
 
+    # Telemetry helpers
+    telem_thread = None
+    telem_stop = threading.Event()
+
     try:
         # allow some sensor warm-up
         time.sleep(0.5)
+
+        # Telemetry background thread
+        if args.telemetry:
+            def _telem_loop():
+                while not telem_stop.is_set():
+                    st = msp.state
+                    br = st.baro_alt_m_raw
+                    ul = st.ultrasonic_alt_m
+                    fu = st.altitude_m
+                    vs = st._altitude_vspeed_mps
+                    bias = st.baro_bias_m
+                    def _fmt(x):
+                        return "None" if x is None else f"{x:.2f}"
+                    print(f"[TEL] baro={_fmt(br)} bias={bias:.2f} ultra={_fmt(ul)} fused={_fmt(fu)} vs={vs:.2f}")
+                    time.sleep(0.2)
+            telem_thread = threading.Thread(target=_telem_loop, daemon=True)
+            telem_thread.start()
+            print("[MAIN] Telemetry enabled")
 
         # Commands
         if args.arm:
@@ -1086,6 +1141,12 @@ def main():
         except Exception as e:
             print(f"[MAIN] Disarm error: {e}")
     finally:
+        try:
+            if telem_thread is not None:
+                telem_stop.set()
+                telem_thread.join(timeout=1.0)
+        except Exception:
+            pass
         try:
             ap.stop()
         except Exception:
