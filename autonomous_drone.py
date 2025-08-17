@@ -489,7 +489,7 @@ class ManualController:
     BUTTON_ARM_DISARM = 4  # LB / L1
     BUTTON_ALTHOLD = 3     # Y / Triangle (hold)
 
-    def __init__(self, deadzone: float = 0.08, yaw_locked: bool = True):
+    def __init__(self, deadzone: float = 0.08, yaw_locked: bool = False):
         self._dz = float(deadzone)
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
@@ -652,12 +652,14 @@ class Autopilot:
         self.invert_roll = invert_roll
         self.invert_pitch = invert_pitch
         self.manual = manual
+        # Sticky manual takeover flag: once True, autonomous stays disabled until restart
+        self.sticky_manual = False
 
         # RC state
         self.rc: List[int] = [PWM_MID] * RC_CHANNELS_COUNT
         self.rc[2] = PWM_MIN
         self.rc[AUX_ARM_CH] = AUX_ARM_LOW
-        for i in range(6, RC_CHANNELS_COUNT):
+        for i in range(5, RC_CHANNELS_COUNT):
             self.rc[i] = PWM_MIN
 
         # control targets
@@ -752,27 +754,27 @@ class Autopilot:
         send_interval = 1.0 / 50.0
         while not self._stop_evt.is_set():
             st = self.msp.state
-            # Manual override: if gamepad active, merge sticks but preserve AUX and (by default) throttle
-            if self.manual is not None and self.manual.has_control():
+            # Manual override: sticky manual pass-through matching remote_control.py
+            if self.manual is not None:
+                # Snapshot current manual RC
                 man = self.manual.get_rc()
-                # start from current autopilot RC (preserve AUX channels)
-                merged = list(self.rc)
-                # sticks
-                merged[0] = int(clamp(man[0], PWM_MIN, PWM_MAX))  # roll
-                merged[1] = int(clamp(man[1], PWM_MIN, PWM_MAX))  # pitch
-                # throttle: only override if manual throttle is raised above near-min
-                if man[2] > PWM_MIN + 20:
-                    merged[2] = int(clamp(man[2], PWM_MIN, PWM_MAX))
-                # yaw
-                merged[3] = int(clamp(man[3], PWM_MIN, PWM_MAX))
-                # Do NOT touch AUX here to avoid accidental disarm on takeover
-                self.rc = merged
-                now = time.time()
-                if now - last_send >= send_interval:
-                    self.msp.send_rc(self.rc)
-                    last_send = now
-                time.sleep(0.01)
-                continue
+                # Engage sticky on first detected manual control OR AUX change (e.g., arming/althold)
+                if not self.sticky_manual:
+                    aux_changed = any(abs((man[i] if i < len(man) else PWM_MIN) - PWM_MIN) > 30 for i in range(4, RC_CHANNELS_COUNT))
+                    if aux_changed or self.manual.has_control():
+                        self.sticky_manual = True
+                        self.mode = self.MODE_IDLE
+                        print("[AP] Manual takeover engaged: RC pass-through active; autonomous disabled until restart")
+                if self.sticky_manual:
+                    # Pass through all channels, including AUX
+                    self.rc = [int(clamp(v, PWM_MIN, PWM_MAX)) for v in man[:RC_CHANNELS_COUNT]]
+                    now = time.time()
+                    if now - last_send >= send_interval:
+                        self.msp.send_rc(self.rc)
+                        last_send = now
+                    time.sleep(0.01)
+                    continue
+
             # default neutral
             roll_cmd = PWM_MID
             pitch_cmd = PWM_MID
