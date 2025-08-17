@@ -535,6 +535,11 @@ class MspClient:
         payload = b''.join(struct.pack('<H', v) for v in self.rc_values)
         self._send_msp(MSP_SET_RAW_RC, payload)
 
+    def get_rc(self) -> List[int]:
+        """Return a copy of the last RC values sent to the FC (8 channels)."""
+        with self._lock:
+            return list(self.rc_values)
+
 
 # ------------------------
 # Ultrasonic Reader (optional)
@@ -1150,20 +1155,21 @@ def main():
     parser.add_argument('--safe-alt', type=float, default=10.0, help='Safe altitude for goto (meters)')
     parser.add_argument('--geofence', type=float, default=20.0, help='Geofence radius from home (meters); set 0 to disable')
     parser.add_argument('--land', action='store_true', help='Land and disarm')
-    parser.add_argument('--angle-limit', type=float, default=45.0, help='Angle mode limit (deg) used for RC mapping')
+    parser.add_argument('--angle-limit', type=float, default=20.0, help='Angle mode limit (deg) used for RC mapping')
     parser.add_argument('--max-tilt', type=float, default=25.0, help='Max commanded tilt (deg) for position control')
     parser.add_argument('--max-speed', type=float, default=5.0, help='Max ground speed target (m/s) for position control (used in damping)')
-    parser.add_argument('--invert-roll', action='store_true', help='Invert roll command mapping')
+    parser.add_argument('--invert-roll', action='store_true', default=True, help='Invert roll command mapping')
     parser.add_argument('--invert-pitch', action='store_true', help='Invert pitch command mapping')
     # Ultrasonic options
     parser.add_argument('--no-ultrasonic', action='store_true', help='Disable ultrasonic altitude fusion')
     parser.add_argument('--ultra-trigger', type=int, default=23, help='Ultrasonic trigger pin (BCM)')
     parser.add_argument('--ultra-echo', type=int, default=24, help='Ultrasonic echo pin (BCM)')
-    parser.add_argument('--ultra-max', type=float, default=1.2, help='Ultrasonic max distance (m)')
+    parser.add_argument('--ultra-max', type=float, default=1.0, help='Ultrasonic max distance (m)')
     # Manual control options
     parser.add_argument('--no-manual', action='store_true', help='Disable gamepad manual override')
-    # Telemetry option
+    # Telemetry options
     parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (altitude, vspeed, battery)')
+    parser.add_argument('--telemetry-rc', action='store_true', help='Print live RC values sent to FC (roll, pitch, throttle, yaw, AUX)')
     parser.add_argument('--debug-msp', action='store_true', help='Verbose MSP debug (checksum drops, first samples)')
     # Battery options
     parser.add_argument('--cells', type=int, default=0, help='Battery cell count (0=auto)')
@@ -1214,30 +1220,39 @@ def main():
 
     try:
         # Telemetry background thread (start early so we can observe calibration)
-        if args.telemetry:
+        if args.telemetry or args.telemetry_rc:
             def _telem_loop():
                 while not telem_stop.is_set():
-                    st = msp.state
-                    br = st.baro_alt_m_raw
-                    ul = st.ultrasonic_alt_m
-                    fu = st.altitude_m
-                    vs = st._altitude_vspeed_mps
-                    bias = st.baro_bias_m
-                    def _fmt(x):
-                        return "None" if x is None else f"{x:.2f}"
-                    vb = st.vbat_v
-                    cells = st.get_cells()
-                    vcell = (vb / cells) if (vb is not None and cells) else None
-                    pct = st.battery_pct
-                    amp = st.amperage_a
-                    mah = st.mah_drawn
-                    pct_s = "None" if pct is None else f"{pct:.0f}%"
-                    cells_s = "None" if (cells is None or cells <= 0) else str(cells)
-                    print(f"[TEL] baro={_fmt(br)} bias={bias:.2f} ultra={_fmt(ul)} fused={_fmt(fu)} vs={vs:.2f} | batt={_fmt(vb)}V cell={_fmt(vcell)}V cells={cells_s} {pct_s} I={_fmt(amp)}A mAh={mah}")
+                    if args.telemetry:
+                        st = msp.state
+                        br = st.baro_alt_m_raw
+                        ul = st.ultrasonic_alt_m
+                        fu = st.altitude_m
+                        vs = st._altitude_vspeed_mps
+                        bias = st.baro_bias_m
+                        def _fmt(x):
+                            return "None" if x is None else f"{x:.2f}"
+                        vb = st.vbat_v
+                        cells = st.get_cells()
+                        vcell = (vb / cells) if (vb is not None and cells) else None
+                        pct = st.battery_pct
+                        amp = st.amperage_a
+                        mah = st.mah_drawn
+                        pct_s = "None" if pct is None else f"{pct:.0f}%"
+                        cells_s = "None" if (cells is None or cells <= 0) else str(cells)
+                        print(f"[TEL] baro={_fmt(br)} bias={bias:.2f} ultra={_fmt(ul)} fused={_fmt(fu)} vs={vs:.2f} | batt={_fmt(vb)}V cell={_fmt(vcell)}V cells={cells_s} {pct_s} I={_fmt(amp)}A mAh={mah}")
+                    if args.telemetry_rc:
+                        rc = msp.get_rc()
+                        # Ensure len 8
+                        rc = (rc + [PWM_MIN] * RC_CHANNELS_COUNT)[:RC_CHANNELS_COUNT]
+                        r, p, t, y = rc[0], rc[1], rc[2], rc[3]
+                        aux1 = rc[AUX_ARM_CH] if len(rc) > AUX_ARM_CH else PWM_MIN
+                        aux2 = rc[5] if len(rc) > 5 else PWM_MIN
+                        print(f"[RC ] roll={r} pitch={p} thr={t} yaw={y} aux1={aux1} aux2={aux2}")
                     time.sleep(0.2)
             telem_thread = threading.Thread(target=_telem_loop, daemon=True)
             telem_thread.start()
-            print("[MAIN] Telemetry enabled")
+            print("[MAIN] Telemetry enabled" + (" (RC)" if args.telemetry_rc and not args.telemetry else ""))
 
         # Calibration (default): wait a couple seconds for sensors/bias to settle
         if not args.no_calibration:
