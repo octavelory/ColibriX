@@ -49,6 +49,7 @@ MSP_SET_RAW_RC = 200
 MSP_ALTITUDE = 109
 MSP_RAW_GPS = 106
 MSP_ATTITUDE = 108
+MSP_ANALOG = 110
 
 RC_CHANNELS_COUNT = 8
 PWM_MIN = 1000
@@ -100,6 +101,18 @@ class DroneState:
     roll_deg: Optional[float] = None
     pitch_deg: Optional[float] = None
     yaw_deg: Optional[float] = None
+
+    # Battery/Power
+    vbat_v: Optional[float] = None          # pack voltage (V)
+    amperage_a: Optional[float] = None      # current draw (A)
+    mah_drawn: int = 0                      # mAh consumed
+    last_battery_update: float = 0.0
+    # Battery configuration and derived
+    battery_cells_config: int = 0           # 0=auto detect by voltage
+    battery_low_cell_v: float = 3.55
+    battery_crit_cell_v: float = 3.40
+    battery_boot_cell_v: float = 3.50
+    battery_pct: Optional[float] = None     # 0..100 estimated from per-cell voltage
 
     # Home
     home_lat_deg: Optional[float] = None
@@ -195,6 +208,48 @@ class DroneState:
         self.altitude_m = max(0.0, self._altitude_lpf)
         self.last_alt_update = now
 
+    # ---- Battery helpers ----
+    def get_cells(self) -> Optional[int]:
+        """Return configured cell count if set, else a simple auto-detect from voltage."""
+        if self.battery_cells_config and self.battery_cells_config > 0:
+            return int(self.battery_cells_config)
+        if self.vbat_v is None:
+            return None
+        # Rough heuristic: divide by nominal 3.7 V/cell (clamped 2..12)
+        cells = int(round(self.vbat_v / 3.7))
+        return max(2, min(12, max(1, cells)))
+
+    def update_battery(self, vbat_v: Optional[float], amperage_a: Optional[float] = None, mah_drawn: Optional[int] = None):
+        now = time.time()
+        if vbat_v is not None:
+            try:
+                self.vbat_v = float(vbat_v)
+            except Exception:
+                self.vbat_v = None
+        if amperage_a is not None:
+            try:
+                self.amperage_a = float(amperage_a)
+            except Exception:
+                self.amperage_a = None
+        if mah_drawn is not None:
+            try:
+                self.mah_drawn = int(mah_drawn)
+            except Exception:
+                pass
+        # Estimate percentage from per-cell voltage (linear 3.30..4.20 V)
+        if self.vbat_v is not None:
+            cells = self.get_cells()
+            if cells and cells > 0:
+                v_cell = self.vbat_v / cells
+                pct = (v_cell - 3.30) / (4.20 - 3.30)
+                pct = 100.0 * pct
+                if pct < 0.0:
+                    pct = 0.0
+                if pct > 100.0:
+                    pct = 100.0
+                self.battery_pct = pct
+        self.last_battery_update = now
+
     def set_home_if_needed(self):
         if not self.home_set and self.gps_fix and self.lat_deg is not None and self.lon_deg is not None:
             self.home_lat_deg = self.lat_deg
@@ -249,6 +304,8 @@ class MspClient:
         self._last_alt_req = 0.0
         self._last_gps_req = 0.0
         self._last_att_req = 0.0
+        self.analog_interval = 0.5
+        self._last_analog_req = 0.0
         self._last_ultra_poll = 0.0
         # RC state
         self.rc_values: List[int] = [PWM_MID] * RC_CHANNELS_COUNT
@@ -332,11 +389,12 @@ class MspClient:
             # advance
             buf = buf[idx + 6 + size:]
             if recv_chk != calc_chk:
+                # Drop corrupted packet and continue
                 continue
-            # decode
-            self._handle_cmd(cmd, payload)
-        # not reached
-
+            try:
+                self._handle_cmd(cmd, payload)
+            except Exception as e:
+                print(f"[MSP] Handler error cmd={cmd}: {e}")
     def _handle_cmd(self, cmd: int, payload: bytes):
         with self._lock:
             if cmd == MSP_ALTITUDE and len(payload) >= 4:
@@ -371,6 +429,31 @@ class MspClient:
                 # Betaflight yaw often [-180,180]. Normalize 0..360 for convenience
                 self.state.yaw_deg = (yaw + 360.0) % 360.0
                 self.state.last_att_update = time.time()
+            elif cmd == MSP_ANALOG and len(payload) >= 1:
+                # MSPv1 ANALOG (legacy):
+                #  byte 0: vbat in 0.1V (uint8)
+                #  bytes 1-2: mAh drawn (uint16)
+                #  bytes 3-4: RSSI (uint16) [ignored]
+                #  bytes 5-6: amperage in 0.01A (int16) [optional]
+                try:
+                    vbat_dV = payload[0]
+                    vbat_v = float(vbat_dV) / 10.0
+                except Exception:
+                    vbat_v = None
+                mah = None
+                if len(payload) >= 3:
+                    try:
+                        mah = struct.unpack('<H', payload[1:3])[0]
+                    except Exception:
+                        mah = None
+                amperage_a = None
+                if len(payload) >= 7:
+                    try:
+                        amp_raw = struct.unpack('<h', payload[5:7])[0]
+                        amperage_a = float(amp_raw) / 100.0
+                    except Exception:
+                        amperage_a = None
+                self.state.update_battery(vbat_v, amperage_a, mah)
 
     # ----- Lifecycle -----
     def start(self):
@@ -389,16 +472,6 @@ class MspClient:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def stop(self):
-        self._stop_evt.set()
-        if self._thread:
-            self._thread.join(timeout=1.0)
-        if self.ser:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-
     def _loop(self):
         while not self._stop_evt.is_set():
             now = time.time()
@@ -412,6 +485,10 @@ class MspClient:
             if now - self._last_att_req > self.att_interval:
                 self._request(MSP_ATTITUDE)
                 self._last_att_req = now
+            # Battery/analog telemetry
+            if now - self._last_analog_req > self.analog_interval:
+                self._request(MSP_ANALOG)
+                self._last_analog_req = now
             # Poll ultrasonic if available
             if self._ultra is not None and (now - self._last_ultra_poll > self.ultra_interval):
                 try:
@@ -702,6 +779,11 @@ class Autopilot:
         # yaw control
         self.yaw_kp = 2.0  # pwm per deg error (via 500/angle_limit scaling)
 
+        # battery states
+        self._batt_saver = False
+        self._batt_forced_land = False
+        self._last_batt_log = 0.0
+
         # position control
         self.pos_kp_deg_per_m = 0.8  # deg tilt per meter error
         self.vel_kd_deg_per_mps = 0.2  # deg per m/s damping
@@ -803,6 +885,30 @@ class Autopilot:
             # heading target default
             if self.target_yaw_deg is None and st.yaw_deg is not None:
                 self.target_yaw_deg = st.yaw_deg
+
+            # Battery monitoring and actions
+            vb = st.vbat_v
+            cells = st.get_cells()
+            if vb is not None and cells is not None and cells > 0:
+                v_cell = vb / cells
+                nowb = time.time()
+                if (not self._batt_forced_land) and (v_cell <= st.battery_crit_cell_v):
+                    self._batt_forced_land = True
+                    print(f"[AP][BAT] Critical voltage {v_cell:.2f} V/cell (pack {vb:.2f} V, cells={cells}). Initiating LAND.")
+                    if self.mode != self.MODE_LAND:
+                        self.land()
+                elif (not self._batt_saver) and (v_cell <= st.battery_low_cell_v):
+                    self._batt_saver = True
+                    old_tilt = self.max_tilt_deg
+                    old_speed = self.max_speed_mps
+                    self.max_tilt_deg = min(self.max_tilt_deg, 15.0)
+                    self.max_speed_mps = min(self.max_speed_mps, 2.5)
+                    print(f"[AP][BAT] Low voltage {v_cell:.2f} V/cell. Battery saver enabled: max_tilt {old_tilt:.1f}->{self.max_tilt_deg:.1f} deg, max_speed {old_speed:.1f}->{self.max_speed_mps:.1f} m/s")
+                if nowb - self._last_batt_log > 10.0:
+                    pct = st.battery_pct
+                    pct_s = 'n/a' if pct is None else f"{pct:.0f}%"
+                    print(f"[AP][BAT] {vb:.2f} V ({v_cell:.2f} V/cell, cells={cells}, {pct_s})")
+                    self._last_batt_log = nowb
 
             # mode logic
             if self.mode == self.MODE_IDLE:
@@ -1043,7 +1149,13 @@ def main():
     # Manual control options
     parser.add_argument('--no-manual', action='store_true', help='Disable gamepad manual override')
     # Telemetry option
-    parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (baro raw, bias, ultrasonic, fused, vspeed)')
+    parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (altitude, vspeed, battery)')
+    # Battery options
+    parser.add_argument('--cells', type=int, default=0, help='Battery cell count (0=auto)')
+    parser.add_argument('--low-cell-v', type=float, default=3.55, help='Low-voltage threshold per cell (V) to enable saver mode')
+    parser.add_argument('--crit-cell-v', type=float, default=3.40, help='Critical-voltage threshold per cell (V) to force landing')
+    parser.add_argument('--boot-cell-v', type=float, default=3.50, help='Minimum per-cell voltage (V) required at startup; below this blocks startup')
+    parser.add_argument('--skip-batt-check', action='store_true', help='Skip startup battery voltage check')
     # Calibration option
     parser.add_argument('--no-calibration', action='store_true', help='Skip startup calibration wait')
 
@@ -1097,7 +1209,15 @@ def main():
                     bias = st.baro_bias_m
                     def _fmt(x):
                         return "None" if x is None else f"{x:.2f}"
-                    print(f"[TEL] baro={_fmt(br)} bias={bias:.2f} ultra={_fmt(ul)} fused={_fmt(fu)} vs={vs:.2f}")
+                    vb = st.vbat_v
+                    cells = st.get_cells()
+                    vcell = (vb / cells) if (vb is not None and cells) else None
+                    pct = st.battery_pct
+                    amp = st.amperage_a
+                    mah = st.mah_drawn
+                    pct_s = "None" if pct is None else f"{pct:.0f}%"
+                    cells_s = "None" if (cells is None or cells <= 0) else str(cells)
+                    print(f"[TEL] baro={_fmt(br)} bias={bias:.2f} ultra={_fmt(ul)} fused={_fmt(fu)} vs={vs:.2f} | batt={_fmt(vb)}V cell={_fmt(vcell)}V cells={cells_s} {pct_s} I={_fmt(amp)}A mAh={mah}")
                     time.sleep(0.2)
             telem_thread = threading.Thread(target=_telem_loop, daemon=True)
             telem_thread.start()
@@ -1113,6 +1233,37 @@ def main():
         else:
             # Minimal warm-up when skipping calibration
             time.sleep(0.2)
+
+        # Apply battery configuration and perform startup check
+        st = msp.state
+        try:
+            st.battery_cells_config = max(0, int(args.cells))
+        except Exception:
+            st.battery_cells_config = 0
+        st.battery_low_cell_v = float(args.low_cell_v)
+        st.battery_crit_cell_v = float(args.crit_cell_v)
+        st.battery_boot_cell_v = float(args.boot_cell_v)
+        if not args.skip_batt_check:
+            # Wait briefly for battery telemetry to arrive
+            t0 = time.time()
+            while st.vbat_v is None and (time.time() - t0) < 3.0:
+                time.sleep(0.1)
+            vb = st.vbat_v
+            cells = st.get_cells()
+            if vb is None or cells is None or cells <= 0:
+                print("[MAIN][BAT] Warning: battery voltage/cells unavailable; skipping startup check")
+            else:
+                v_cell = vb / cells
+                if v_cell < st.battery_boot_cell_v:
+                    print(f"[MAIN][BAT] Startup blocked: {v_cell:.2f} V/cell < boot {st.battery_boot_cell_v:.2f} V (pack {vb:.2f} V, cells={cells}). Use --skip-batt-check to override.")
+                    # Ensure disarmed state
+                    try:
+                        ap.disarm()
+                    except Exception:
+                        pass
+                    sys.exit(2)
+                else:
+                    print(f"[MAIN][BAT] Battery OK for startup: {vb:.2f} V ({v_cell:.2f} V/cell, cells={cells})")
 
         # Commands
         if args.arm:

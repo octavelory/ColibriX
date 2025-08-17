@@ -76,6 +76,16 @@ Key options (selection)
 - `--port`: serial port (auto on Pi; e.g. `COM3` on Windows)
 - `--alt`, `--safe-alt`, `--geofence`: altitude target, cruise safety altitude, radius geofence
 - `--ultra/--no-ultra`: enable/disable ultrasonic fusion (if supported)
+- `--telemetry`: print live telemetry including altitude fusion and battery metrics
+- Battery configuration and safety thresholds:
+  - `--cells N`: battery cell count (0 = auto)
+  - `--low-cell-v V`: low-voltage per-cell threshold (default 3.55 V) -> enables battery saver (reduced tilt/speed)
+  - `--crit-cell-v V`: critical per-cell threshold (default 3.40 V) -> triggers forced landing
+  - `--boot-cell-v V`: minimum per-cell at startup (default 3.50 V) -> blocks startup if below
+  - `--skip-batt-check`: skip the startup battery check (not recommended)
+- Calibration:
+  - By default, a short calibration wait (~2s) lets sensors settle.
+  - `--no-calibration` to skip.
 
 ### 2) Demo mission
 `demo_mission.py` shows a mini‑mission using `Autopilot`.
@@ -117,7 +127,7 @@ python test_buttons.py
 
 ## How it works (high level)
 
-- MSP transport: `MspClient` encapsulates MSP framing, periodic polling of `MSP_ALTITUDE`, `MSP_RAW_GPS`, `MSP_ATTITUDE`, and RC outputs via `MSP_SET_RAW_RC`.
+- MSP transport: `MspClient` encapsulates MSP framing, periodic polling of `MSP_ALTITUDE`, `MSP_RAW_GPS`, `MSP_ATTITUDE`, `MSP_ANALOG` (battery), and RC outputs via `MSP_SET_RAW_RC`.
 - Sensor fusion: `DroneState` fuses baro altitude with optional ultrasonic using a smooth blend near the ultrasonic’s range limit, plus a slow baro bias calibration near ground.
 - Autopilot: `Autopilot` runs in a control loop with modes `IDLE/TAKEOFF/HOLD/GOTO/LAND`. It implements:
   - Altitude PI around a slowly adapting hover PWM estimator
@@ -133,9 +143,13 @@ Key classes/functions
 
 ## Current limitations and safety
 - No automatic Return‑to‑Home yet.
-- Battery policy (prototype):
-  - Low (<20%): continue and try to get close to destination.
-  - Critical (<10%): attempt nearest safe landing (no obstacle sensing if Pi stack fails).
+- Battery monitoring and policy (prototype):
+  - Battery telemetry via MSP `MSP_ANALOG` provides pack voltage, current, and mAh.
+  - Startup safety: by default, the CLI blocks operation if the per‑cell voltage is below `--boot-cell-v` (default 3.50 V). Use `--skip-batt-check` to override.
+  - In flight:
+    - Low per‑cell voltage (< `--low-cell-v`, default 3.55 V): battery saver mode reduces max tilt and max speed.
+    - Critical per‑cell voltage (< `--crit-cell-v`, default 3.40 V): automatic forced landing.
+  - Battery cell count can be set (`--cells`) or auto‑detected from pack voltage.
 - Weather: not water‑proof; wind not yet stress‑tested.
 - Failures: if the Pi stack fails, FC can still stabilize but without obstacle avoidance. FC failure = crash (never observed during tests).
 
