@@ -976,7 +976,7 @@ def main():
     parser.add_argument('--goto', nargs=2, type=float, default=None, metavar=('LAT', 'LON'), help='Goto target lat lon')
     parser.add_argument('--alt', type=float, default=None, help='Target altitude for goto (meters)')
     parser.add_argument('--safe-alt', type=float, default=10.0, help='Safe altitude for goto (meters)')
-    parser.add_argument('--geofence', type=float, default=200.0, help='Geofence radius from home (meters); set 0 to disable')
+    parser.add_argument('--geofence', type=float, default=20.0, help='Geofence radius from home (meters); set 0 to disable')
     parser.add_argument('--land', action='store_true', help='Land and disarm')
     parser.add_argument('--angle-limit', type=float, default=45.0, help='Angle mode limit (deg) used for RC mapping')
     parser.add_argument('--max-tilt', type=float, default=25.0, help='Max commanded tilt (deg) for position control')
