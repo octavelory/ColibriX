@@ -1066,7 +1066,16 @@ def main():
         while True:
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\n[MAIN] Stopping...")
+        print("\n[MAIN] EMERGENCY DISARM (Ctrl+C)...")
+        try:
+            # Send multiple disarm frames to ensure FC receives it
+            ap.disarm()
+            time.sleep(0.1)
+            ap.disarm()
+            time.sleep(0.1)
+            ap.disarm()
+        except Exception as e:
+            print(f"[MAIN] Disarm error: {e}")
     finally:
         try:
             ap.stop()

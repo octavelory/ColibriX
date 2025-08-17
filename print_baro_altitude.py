@@ -18,7 +18,7 @@ from autonomous_drone import MspClient
 
 def main():
     parser = argparse.ArgumentParser(description="Print barometric altitude (meters) via MSP")
-    parser.add_argument("--port", required=True, help="Serial port of the FC (e.g., COM5 on Windows)")
+    parser.add_argument("--port", required=False, default="/dev/ttyAMA0", help="Serial port of the FC (e.g., COM5 on Windows)")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
     parser.add_argument("--rate", type=float, default=5.0, help="Print rate in Hz (default: 5.0)")
     args = parser.parse_args()
