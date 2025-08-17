@@ -288,7 +288,8 @@ class MspClient:
                  use_ultrasonic: bool = ULTRA_DEFAULT_ENABLED,
                  ultra_trigger_pin: int = 23,
                  ultra_echo_pin: int = 24,
-                 ultra_max_distance_m: float = 1.2):
+                 ultra_max_distance_m: float = 1.2,
+                 debug_msp: bool = False):
         self.port = port
         self.baud = baud
         self.ser: Optional[serial.Serial] = None
@@ -296,6 +297,8 @@ class MspClient:
         self.state = DroneState()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # TX lock to avoid interleaved writes from multiple threads
+        self._tx_lock = threading.Lock()
         # polling intervals (s)
         self.alt_interval = 0.05
         self.gps_interval = 0.5
@@ -319,6 +322,11 @@ class MspClient:
         self._ultra_trigger_pin = ultra_trigger_pin
         self._ultra_echo_pin = ultra_echo_pin
         self._ultra_max_distance_m = ultra_max_distance_m
+        # Debug and RX stats
+        self.debug = debug_msp
+        self._rx_bad_checksum = 0
+        self._got_first_alt = False
+        self._got_first_analog = False
 
     # ----- Serial -----
     def _open_serial(self) -> serial.Serial:
@@ -359,7 +367,8 @@ class MspClient:
         chk = self._checksum(payload)
         pkt = header + payload + struct.pack('<B', chk)
         try:
-            self.ser.write(pkt)
+            with self._tx_lock:
+                self.ser.write(pkt)
         except Exception as e:
             print(f"[MSP] Serial write error: {e}")
 
@@ -390,6 +399,9 @@ class MspClient:
             buf = buf[idx + 6 + size:]
             if recv_chk != calc_chk:
                 # Drop corrupted packet and continue
+                self._rx_bad_checksum += 1
+                if getattr(self, "debug", False) and (self._rx_bad_checksum % 50 == 1):
+                    print(f"[MSP] Dropped packets due to checksum: {self._rx_bad_checksum}")
                 continue
             try:
                 self._handle_cmd(cmd, payload)
@@ -400,6 +412,7 @@ class MspClient:
             if cmd == MSP_ALTITUDE and len(payload) >= 4:
                 alt_cm = struct.unpack('<i', payload[0:4])[0]
                 self.state.update_baro_alt(float(alt_cm) / 100.0)
+                self._got_first_alt = True
             elif cmd == MSP_RAW_GPS and len(payload) >= 16:
                 fix = payload[0] != 0
                 sats = payload[1]
@@ -454,6 +467,7 @@ class MspClient:
                     except Exception:
                         amperage_a = None
                 self.state.update_battery(vbat_v, amperage_a, mah)
+                self._got_first_analog = True
 
     # ----- Lifecycle -----
     def start(self):
@@ -1150,6 +1164,7 @@ def main():
     parser.add_argument('--no-manual', action='store_true', help='Disable gamepad manual override')
     # Telemetry option
     parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (altitude, vspeed, battery)')
+    parser.add_argument('--debug-msp', action='store_true', help='Verbose MSP debug (checksum drops, first samples)')
     # Battery options
     parser.add_argument('--cells', type=int, default=0, help='Battery cell count (0=auto)')
     parser.add_argument('--low-cell-v', type=float, default=3.55, help='Low-voltage threshold per cell (V) to enable saver mode')
@@ -1167,6 +1182,7 @@ def main():
         ultra_trigger_pin=args.ultra_trigger,
         ultra_echo_pin=args.ultra_echo,
         ultra_max_distance_m=args.ultra_max,
+        debug_msp=args.debug_msp,
     )
     try:
         msp.start()
@@ -1229,6 +1245,14 @@ def main():
             print(f"[MAIN] Calibration: waiting {wait_s:.1f}s for sensors to settle (use --no-calibration to skip)")
             t0 = time.time()
             while (time.time() - t0) < wait_s:
+                # Actively request early samples for baro and battery
+                try:
+                    if not getattr(msp, '_got_first_alt', False):
+                        msp._request(MSP_ALTITUDE)
+                    if not getattr(msp, '_got_first_analog', False):
+                        msp._request(MSP_ANALOG)
+                except Exception:
+                    pass
                 time.sleep(0.1)
         else:
             # Minimal warm-up when skipping calibration
