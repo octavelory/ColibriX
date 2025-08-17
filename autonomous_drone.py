@@ -1244,14 +1244,20 @@ def main():
         st.battery_crit_cell_v = float(args.crit_cell_v)
         st.battery_boot_cell_v = float(args.boot_cell_v)
         if not args.skip_batt_check:
-            # Wait briefly for battery telemetry to arrive
+            # Wait for battery telemetry to arrive (actively request ANALOG)
+            wait_s = 5.0
             t0 = time.time()
-            while st.vbat_v is None and (time.time() - t0) < 3.0:
-                time.sleep(0.1)
+            while st.vbat_v is None and (time.time() - t0) < wait_s:
+                try:
+                    # Proactively request analog to speed up first sample
+                    msp._request(MSP_ANALOG)
+                except Exception:
+                    pass
+                time.sleep(0.2)
             vb = st.vbat_v
             cells = st.get_cells()
             if vb is None or cells is None or cells <= 0:
-                print("[MAIN][BAT] Warning: battery voltage/cells unavailable; skipping startup check")
+                print(f"[MAIN][BAT] Startup battery check skipped: no battery telemetry within {wait_s:.1f}s")
             else:
                 v_cell = vb / cells
                 if v_cell < st.battery_boot_cell_v:
