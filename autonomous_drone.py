@@ -468,6 +468,167 @@ class UltrasonicReader:
 
 
 # ------------------------
+# Manual Controller (Gamepad override)
+# ------------------------
+class ManualController:
+    """Gamepad-driven manual RC override, similar to remote_control.py.
+
+    - Uses pygame joystick to read axes/buttons in a background thread
+    - Provides has_control() to indicate when manual should override autopilot
+    - Provides get_rc() to return current 8-channel RC values (1000..2000)
+    - Gracefully disables itself if pygame or a gamepad is unavailable
+    """
+
+    # Axis mapping (matches remote_control.py defaults)
+    AXIS_YAW = 0        # left stick X
+    AXIS_THROTTLE = 1   # left stick Y (inverted)
+    AXIS_ROLL = 3       # right stick X
+    AXIS_PITCH = 4      # right stick Y (inverted)
+
+    # Button mapping (common Xbox layout)
+    BUTTON_ARM_DISARM = 4  # LB / L1
+    BUTTON_ALTHOLD = 3     # Y / Triangle (hold)
+
+    def __init__(self, deadzone: float = 0.08, yaw_locked: bool = True):
+        self._dz = float(deadzone)
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+        self._connected = False
+        self._active = False
+        self.yaw_locked = yaw_locked
+
+        # RC state (8 channels)
+        self._rc: List[int] = [PWM_MID] * RC_CHANNELS_COUNT
+        self._rc[2] = PWM_MIN  # throttle low
+        self._rc[AUX_ARM_CH] = AUX_ARM_LOW
+        for i in range(5, RC_CHANNELS_COUNT):
+            self._rc[i] = PWM_MIN  # AUX low by default
+
+        # pygame setup (lazy import to keep dependency optional)
+        try:
+            import pygame  # type: ignore
+        except Exception as e:
+            raise RuntimeError("pygame not available; manual controller disabled") from e
+        self._pg = pygame
+        self._pg.init()
+        self._pg.joystick.init()
+        if self._pg.joystick.get_count() <= 0:
+            raise RuntimeError("No gamepad detected; manual controller disabled")
+        self._js = self._pg.joystick.Joystick(0)
+        self._js.init()
+        self._connected = True
+
+        # background thread
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    # ----- Public API -----
+    def has_control(self) -> bool:
+        """True when sticks are deflected (or throttle raised) and gamepad connected."""
+        return self._connected and self._active
+
+    def get_rc(self) -> List[int]:
+        with self._lock:
+            return list(self._rc)
+
+    def stop(self):
+        self._stop_evt.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            # Quit pygame subsystems if we started them
+            self._pg.joystick.quit()
+            self._pg.quit()
+        except Exception:
+            pass
+
+    # ----- Internals -----
+    def _map_axis_to_rc(self, axis_value: float, min_rc: int = PWM_MIN, max_rc: int = PWM_MAX, inverted: bool = False) -> int:
+        v = float(axis_value)
+        if abs(v) < self._dz:
+            v = 0.0
+        if inverted:
+            v = -v
+        normalized = (v + 1.0) / 2.0
+        return int(clamp(min_rc + normalized * (max_rc - min_rc), PWM_MIN, PWM_MAX))
+
+    def _loop(self):
+        try:
+            while not self._stop_evt.is_set():
+                # process events
+                for event in self._pg.event.get():
+                    if event.type == self._pg.JOYAXISMOTION:
+                        if event.axis == self.AXIS_YAW:
+                            if not self.yaw_locked:
+                                with self._lock:
+                                    self._rc[3] = self._map_axis_to_rc(event.value)
+                        elif event.axis == self.AXIS_THROTTLE:
+                            with self._lock:
+                                self._rc[2] = self._map_axis_to_rc(event.value, PWM_MIN, PWM_MAX, inverted=True)
+                        elif event.axis == self.AXIS_ROLL:
+                            with self._lock:
+                                self._rc[0] = self._map_axis_to_rc(event.value)
+                        elif event.axis == self.AXIS_PITCH:
+                            with self._lock:
+                                self._rc[1] = self._map_axis_to_rc(event.value, PWM_MIN, PWM_MAX, inverted=True)
+
+                    elif event.type == self._pg.JOYBUTTONDOWN:
+                        if event.button == self.BUTTON_ARM_DISARM:
+                            with self._lock:
+                                # arm only if throttle is low for safety
+                                if self._rc[2] <= PWM_MIN + THROTTLE_SAFETY_ARM_OFFSET:
+                                    self._rc[AUX_ARM_CH] = AUX_ARM_HIGH if self._rc[AUX_ARM_CH] == AUX_ARM_LOW else AUX_ARM_LOW
+                                else:
+                                    print("[MANUAL] Refuse arm: throttle too high")
+                        elif event.button == self.BUTTON_ALTHOLD:
+                            with self._lock:
+                                # AUX2 high while held
+                                if RC_CHANNELS_COUNT > 5:
+                                    self._rc[5] = 1800
+
+                    elif event.type == self._pg.JOYBUTTONUP:
+                        if event.button == self.BUTTON_ALTHOLD:
+                            with self._lock:
+                                if RC_CHANNELS_COUNT > 5:
+                                    self._rc[5] = 1000
+
+                    elif event.type == self._pg.JOYDEVICEREMOVED:
+                        self._connected = False
+                        self._active = False
+
+                    elif event.type == self._pg.JOYDEVICEADDED:
+                        # try to reinit
+                        try:
+                            if self._pg.joystick.get_count() > 0:
+                                self._js = self._pg.joystick.Joystick(0)
+                                self._js.init()
+                                self._connected = True
+                        except Exception:
+                            pass
+
+                # enforce yaw lock if enabled
+                if self.yaw_locked:
+                    with self._lock:
+                        self._rc[3] = PWM_MID
+
+                # update active flag based on stick deflection
+                with self._lock:
+                    roll_dev = abs(self._rc[0] - PWM_MID) > 20
+                    pitch_dev = abs(self._rc[1] - PWM_MID) > 20
+                    yaw_dev = (not self.yaw_locked) and (abs(self._rc[3] - PWM_MID) > 20)
+                    thr_active = self._rc[2] > PWM_MIN + 5
+                self._active = self._connected and (roll_dev or pitch_dev or yaw_dev or thr_active)
+
+                time.sleep(0.01)
+        except Exception as e:
+            print(f"[MANUAL] Stopped due to error: {e}")
+            self._connected = False
+            self._active = False
+
+
+# ------------------------
 # Autopilot
 # ------------------------
 class Autopilot:
@@ -482,13 +643,15 @@ class Autopilot:
                  max_tilt_deg: float = 25.0,
                  max_speed_mps: float = 5.0,
                  invert_roll: bool = False,
-                 invert_pitch: bool = True):  # match remote_control default feel
+                 invert_pitch: bool = True,  # match remote_control default feel
+                 manual: Optional[ManualController] = None):
         self.msp = msp
         self.angle_limit_deg = max(5.0, min(85.0, angle_limit_deg))
         self.max_tilt_deg = max(5.0, min(self.angle_limit_deg, max_tilt_deg))
         self.max_speed_mps = max(0.5, min(20.0, max_speed_mps))
         self.invert_roll = invert_roll
         self.invert_pitch = invert_pitch
+        self.manual = manual
 
         # RC state
         self.rc: List[int] = [PWM_MID] * RC_CHANNELS_COUNT
@@ -589,6 +752,15 @@ class Autopilot:
         send_interval = 1.0 / 50.0
         while not self._stop_evt.is_set():
             st = self.msp.state
+            # Manual override: if gamepad active, pass-through RC and skip autopilot
+            if self.manual is not None and self.manual.has_control():
+                self.rc = self.manual.get_rc()
+                now = time.time()
+                if now - last_send >= send_interval:
+                    self.msp.send_rc(self.rc)
+                    last_send = now
+                time.sleep(0.01)
+                continue
             # default neutral
             roll_cmd = PWM_MID
             pitch_cmd = PWM_MID
@@ -816,6 +988,8 @@ def main():
     parser.add_argument('--ultra-trigger', type=int, default=23, help='Ultrasonic trigger pin (BCM)')
     parser.add_argument('--ultra-echo', type=int, default=24, help='Ultrasonic echo pin (BCM)')
     parser.add_argument('--ultra-max', type=float, default=1.2, help='Ultrasonic max distance (m)')
+    # Manual control options
+    parser.add_argument('--no-manual', action='store_true', help='Disable gamepad manual override')
 
     args = parser.parse_args()
 
@@ -832,6 +1006,14 @@ def main():
         print(f"[MSP] Failed to start: {e}")
         sys.exit(1)
 
+    manual = None
+    if not args.no_manual:
+        try:
+            manual = ManualController()
+            print("[MAIN] Manual controller enabled (gamepad)")
+        except Exception as e:
+            print(f"[MAIN] Manual controller disabled: {e}")
+
     ap = Autopilot(
         msp,
         angle_limit_deg=args.angle_limit,
@@ -839,6 +1021,7 @@ def main():
         max_speed_mps=args.max_speed,
         invert_roll=args.invert_roll,
         invert_pitch=args.invert_pitch or True,  # default True to match remote_control feel
+        manual=manual,
     )
 
     try:
@@ -875,6 +1058,11 @@ def main():
             pass
         try:
             msp.stop()
+        except Exception:
+            pass
+        try:
+            if 'manual' in locals() and manual is not None:
+                manual.stop()
         except Exception:
             pass
 
