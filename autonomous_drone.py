@@ -1441,9 +1441,9 @@ def main():
     parser.add_argument('--no-hover-persist', action='store_true', help='Disable saving/loading learned hover throttle')
     parser.add_argument('--hover-file', type=str, default=HOVER_PERSIST_DEFAULT_PATH, help='Path to store learned hover throttle (JSON)')
     parser.add_argument('--takeoff-boost', type=int, default=80, help='Extra PWM added above hover during initial takeoff window')
-    parser.add_argument('--takeoff-boost-time', type=float, default=0.7, help='Duration (s) to apply takeoff boost window')
+    parser.add_argument('--takeoff-boost-time', type=float, default=1, help='Duration (s) to apply takeoff boost window')
     # Hover model controls
-    parser.add_argument('--hover-baseline', type=int, default=None, help='Baseline hover PWM hint (e.g., 1500)')
+    parser.add_argument('--hover-baseline', type=int, default=1500, help='Baseline hover PWM hint (e.g., 1500)')
     parser.add_argument('--hover-reset', action='store_true', help='Reset stored hover model on startup')
     parser.add_argument('--hover-alpha', type=float, default=0.08, help='Learning rate (EMA) for base hover model (0.001..0.5)')
     parser.add_argument('--hover-vref', type=float, default=None, help='Reference per-cell voltage (V) for compensation (default 3.80V)')
