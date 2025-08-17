@@ -32,6 +32,8 @@ import struct
 import sys
 import threading
 import time
+import os
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -62,6 +64,10 @@ AUX_ARM_LOW = 1000
 
 THROTTLE_SAFETY_ARM_OFFSET = 50  # throttle must be <= (min + offset) to arm
 
+# Hover persistence defaults
+HOVER_PERSIST_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".colibrix_hover.json")
+HOVER_MIN_PWM = PWM_MIN + 200
+HOVER_MAX_PWM = PWM_MAX - 200
 # ------------------------
 # Ultrasonic Fusion Config
 # ------------------------
@@ -278,6 +284,63 @@ def bearing_deg(from_lat: float, from_lon: float, to_lat: float, to_lon: float) 
     x = math.cos(math.radians(from_lat)) * math.sin(math.radians(to_lat)) - math.sin(math.radians(from_lat)) * math.cos(math.radians(to_lat)) * math.cos(math.radians(to_lon - from_lon))
     brng = math.degrees(math.atan2(y, x))
     return (brng + 360.0) % 360.0
+
+
+# ------------------------
+# Hover Persistence
+# ------------------------
+class HoverStore:
+    def __init__(self, path: Optional[str] = None, enabled: bool = True):
+        self.path = path or HOVER_PERSIST_DEFAULT_PATH
+        self.enabled = bool(enabled)
+        self.value: Optional[int] = None
+        self.last_save: float = 0.0
+        self._load()
+
+    def _load(self):
+        if not self.enabled:
+            return
+        try:
+            with open(self.path, 'r') as f:
+                data = json.load(f)
+            v = int(data.get('hover_pwm', 0))
+            if v > 0:
+                self.value = int(clamp(v, HOVER_MIN_PWM, HOVER_MAX_PWM))
+        except Exception:
+            # ignore load errors
+            pass
+
+    def get(self, default_pwm: int) -> int:
+        if self.enabled and (self.value is not None):
+            return int(self.value)
+        return int(default_pwm)
+
+    def update(self, new_pwm: int, st: DroneState):
+        if not self.enabled:
+            return
+        new_pwm = int(clamp(new_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
+        if self.value is None:
+            self.value = new_pwm
+        else:
+            alpha = 0.2  # persistence smoothing
+            self.value = int(round((1.0 - alpha) * self.value + alpha * new_pwm))
+        now = time.time()
+        if now - self.last_save > 2.0:
+            self._save()
+
+    def _save(self):
+        if not self.enabled:
+            return
+        try:
+            ddir = os.path.dirname(self.path)
+            if ddir and not os.path.exists(ddir):
+                os.makedirs(ddir, exist_ok=True)
+            with open(self.path, 'w') as f:
+                json.dump({'hover_pwm': int(self.value or 0), 'updated': time.time()}, f)
+            self.last_save = time.time()
+        except Exception:
+            # ignore save errors
+            pass
 
 
 # ------------------------
@@ -756,7 +819,10 @@ class Autopilot:
                  max_speed_mps: float = 5.0,
                  invert_roll: bool = False,
                  invert_pitch: bool = True,  # match remote_control default feel
-                 manual: Optional[ManualController] = None):
+                 manual: Optional[ManualController] = None,
+                 hover_store: Optional[HoverStore] = None,
+                 takeoff_boost_pwm: int = 80,
+                 takeoff_boost_time: float = 0.7):
         self.msp = msp
         self.angle_limit_deg = max(5.0, min(85.0, angle_limit_deg))
         self.max_tilt_deg = max(5.0, min(self.angle_limit_deg, max_tilt_deg))
@@ -764,6 +830,7 @@ class Autopilot:
         self.invert_roll = invert_roll
         self.invert_pitch = invert_pitch
         self.manual = manual
+        self.hover_store = hover_store
         # Sticky manual takeover flag: once True, autonomous stays disabled until restart
         self.sticky_manual = False
 
@@ -789,11 +856,25 @@ class Autopilot:
         self._land_touchdown_start: Optional[float] = None
 
         # altitude control
+        # initialize hover from store if provided
         self.hover_pwm = 1500
+        if self.hover_store is not None:
+            try:
+                self.hover_pwm = int(clamp(self.hover_store.get(self.hover_pwm), HOVER_MIN_PWM, HOVER_MAX_PWM))
+            except Exception:
+                pass
         self.alt_kp = 20.0
         self.alt_ki = 2.0
         self.alt_i = 0.0
         self.alt_pwm_max = 150  # +/- around hover
+        # persistence helpers
+        self._hover_stable_since: Optional[float] = None
+        self._last_hover_persist: float = 0.0
+
+        # takeoff boost
+        self.takeoff_boost_pwm = int(max(0, takeoff_boost_pwm))
+        self.takeoff_boost_time = float(max(0.0, takeoff_boost_time))
+        self._takeoff_boost_until: float = 0.0
 
         # yaw control
         self.yaw_kp = 2.0  # pwm per deg error (via 500/angle_limit scaling)
@@ -837,6 +918,8 @@ class Autopilot:
         self.target_alt_m = max(0.5, alt_m)
         self.mode = self.MODE_TAKEOFF
         print(f"[AP] Takeoff to {self.target_alt_m:.2f} m")
+        # arm takeoff boost window
+        self._takeoff_boost_until = time.time() + self.takeoff_boost_time
 
     def hold(self, use_pos: bool = True):
         # lock current altitude and position
@@ -944,6 +1027,12 @@ class Autopilot:
                 pitch_cmd = PWM_MID
                 # altitude control to climb to target
                 thr_cmd = self._altitude_cmd(st)
+                # initial boost to ensure prompt liftoff before fused altitude stabilizes
+                nowt = time.time()
+                if nowt < self._takeoff_boost_until:
+                    low_alt = (st.altitude_m is None) or (st.altitude_m < 0.15)
+                    if low_alt and self.takeoff_boost_pwm > 0:
+                        thr_cmd = max(thr_cmd, int(clamp(self.hover_pwm + self.takeoff_boost_pwm, PWM_MIN, PWM_MAX)))
                 # transition when reached
                 if st.altitude_m is not None and self.target_alt_m is not None:
                     if st.altitude_m >= self.target_alt_m - 0.1:
@@ -1075,8 +1164,31 @@ class Autopilot:
             adjust = clamp(adjust - 50, -self.alt_pwm_max, self.alt_pwm_max)
         cmd = int(clamp(self.hover_pwm + adjust, PWM_MIN, PWM_MAX))
         # hover estimator: slowly adapt so that on average adjust -> 0
-        self.hover_pwm = int(clamp(0.999 * self.hover_pwm + 0.001 * cmd, PWM_MIN + 200, PWM_MAX - 200))
+        self.hover_pwm = int(clamp(0.999 * self.hover_pwm + 0.001 * cmd, HOVER_MIN_PWM, HOVER_MAX_PWM))
+        # persist hover if stable around target (not during landing)
+        if not landing:
+            self._maybe_persist_hover(st, err)
         return cmd
+
+    def _maybe_persist_hover(self, st: DroneState, err: float):
+        if self.hover_store is None:
+            return
+        if st.altitude_m is None or self.target_alt_m is None:
+            self._hover_stable_since = None
+            return
+        # stability conditions
+        stable_alt = abs(err) < 0.05
+        stable_vs = abs(st._altitude_vspeed_mps) < 0.06
+        if self.mode in (self.MODE_HOLD, self.MODE_TAKEOFF, self.MODE_GOTO) and stable_alt and stable_vs:
+            now = time.time()
+            if self._hover_stable_since is None:
+                self._hover_stable_since = now
+            # persist every ~1s after at least 0.8s of stability
+            if (now - self._hover_stable_since) > 0.8 and (now - self._last_hover_persist) > 1.0:
+                self.hover_store.update(self.hover_pwm, st)
+                self._last_hover_persist = now
+        else:
+            self._hover_stable_since = None
 
     def _yaw_hold_cmd(self, st: DroneState) -> int:
         if st.yaw_deg is None:
@@ -1171,6 +1283,11 @@ def main():
     parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (altitude, vspeed, battery)')
     parser.add_argument('--telemetry-rc', action='store_true', help='Print live RC values sent to FC (roll, pitch, throttle, yaw, AUX)')
     parser.add_argument('--debug-msp', action='store_true', help='Verbose MSP debug (checksum drops, first samples)')
+    # Hover persistence and takeoff boost
+    parser.add_argument('--no-hover-persist', action='store_true', help='Disable saving/loading learned hover throttle')
+    parser.add_argument('--hover-file', type=str, default=HOVER_PERSIST_DEFAULT_PATH, help='Path to store learned hover throttle (JSON)')
+    parser.add_argument('--takeoff-boost', type=int, default=80, help='Extra PWM added above hover during initial takeoff window')
+    parser.add_argument('--takeoff-boost-time', type=float, default=0.7, help='Duration (s) to apply takeoff boost window')
     # Battery options
     parser.add_argument('--cells', type=int, default=0, help='Battery cell count (0=auto)')
     parser.add_argument('--low-cell-v', type=float, default=3.55, help='Low-voltage threshold per cell (V) to enable saver mode')
@@ -1204,6 +1321,8 @@ def main():
         except Exception as e:
             print(f"[MAIN] Manual controller disabled: {e}")
 
+    hover_store = HoverStore(path=args.hover_file, enabled=(not args.no_hover_persist))
+
     ap = Autopilot(
         msp,
         angle_limit_deg=args.angle_limit,
@@ -1212,7 +1331,16 @@ def main():
         invert_roll=args.invert_roll,
         invert_pitch=args.invert_pitch or True,  # default True to match remote_control feel
         manual=manual,
+        hover_store=hover_store,
+        takeoff_boost_pwm=int(args.takeoff_boost),
+        takeoff_boost_time=float(args.takeoff_boost_time),
     )
+
+    try:
+        store_val = hover_store.value
+        print(f"[MAIN] Hover PWM init: {ap.hover_pwm} (store={store_val if store_val is not None else 'None'})")
+    except Exception:
+        pass
 
     # Telemetry helpers
     telem_thread = None
