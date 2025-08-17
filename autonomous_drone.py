@@ -752,9 +752,21 @@ class Autopilot:
         send_interval = 1.0 / 50.0
         while not self._stop_evt.is_set():
             st = self.msp.state
-            # Manual override: if gamepad active, pass-through RC and skip autopilot
+            # Manual override: if gamepad active, merge sticks but preserve AUX and (by default) throttle
             if self.manual is not None and self.manual.has_control():
-                self.rc = self.manual.get_rc()
+                man = self.manual.get_rc()
+                # start from current autopilot RC (preserve AUX channels)
+                merged = list(self.rc)
+                # sticks
+                merged[0] = int(clamp(man[0], PWM_MIN, PWM_MAX))  # roll
+                merged[1] = int(clamp(man[1], PWM_MIN, PWM_MAX))  # pitch
+                # throttle: only override if manual throttle is raised above near-min
+                if man[2] > PWM_MIN + 20:
+                    merged[2] = int(clamp(man[2], PWM_MIN, PWM_MAX))
+                # yaw
+                merged[3] = int(clamp(man[3], PWM_MIN, PWM_MAX))
+                # Do NOT touch AUX here to avoid accidental disarm on takeover
+                self.rc = merged
                 now = time.time()
                 if now - last_send >= send_interval:
                     self.msp.send_rc(self.rc)
@@ -1030,6 +1042,10 @@ def main():
 
         # Commands
         if args.arm:
+            ap.arm()
+            time.sleep(0.2)
+        # Auto-arm for flight-related commands
+        if (args.takeoff is not None) or args.hold or (args.goto is not None):
             ap.arm()
             time.sleep(0.2)
         if args.takeoff is not None:
