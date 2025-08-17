@@ -454,6 +454,29 @@ class HoverStore:
             # ignore save errors
             pass
 
+    def reset_model(self, baseline_hint: Optional[int] = None, vcell_ref: Optional[float] = None, save: bool = True):
+        """Reset the hover model in-memory to a baseline and optionally save to disk."""
+        # Choose baseline from hint, legacy value, or conservative default
+        base = baseline_hint if baseline_hint is not None else (self.value if self.value is not None else 1500)
+        try:
+            self.base_hover_pwm = int(clamp(int(base), HOVER_MIN_PWM, HOVER_MAX_PWM))
+        except Exception:
+            self.base_hover_pwm = int(clamp(1500, HOVER_MIN_PWM, HOVER_MAX_PWM))
+        # Reset compensation slope and counters
+        if vcell_ref is not None:
+            try:
+                self.vcell_ref = float(vcell_ref)
+            except Exception:
+                pass
+        self.slope_pwm_per_v = 0.0
+        self.sample_count = 0
+        # Opportunistically save
+        if save:
+            try:
+                self._save()
+            except Exception:
+                pass
+
 
 # ------------------------
 # MSP Client
@@ -935,7 +958,19 @@ class Autopilot:
                  hover_store: Optional[HoverStore] = None,
                  takeoff_boost_pwm: int = 80,
                  takeoff_boost_time: float = 0.7,
-                 hover_runtime_alpha: float = 0.20):
+                 hover_runtime_alpha: float = 0.20,
+                 alt_kp: float = 20.0,
+                 alt_ki: float = 2.0,
+                 alt_pwm_max: int = 150,
+                 # Hover persistence and learning controls
+                 hover_stable_alt_eps: float = 0.05,
+                 hover_stable_vs_eps: float = 0.06,
+                 hover_stable_tilt_deg: float = 10.0,
+                 hover_small_adjust_pwm: float = 15.0,
+                 hover_persist_interval_s: float = 1.0,
+                 hover_stable_dwell_s: float = 0.8,
+                 hover_early_alpha: float = 0.20,
+                 hover_early_samples: int = 10):
         self.msp = msp
         self.angle_limit_deg = max(5.0, min(85.0, angle_limit_deg))
         self.max_tilt_deg = max(5.0, min(self.angle_limit_deg, max_tilt_deg))
@@ -977,10 +1012,10 @@ class Autopilot:
                 self.hover_pwm = int(clamp(self.hover_store.get(self.hover_pwm), HOVER_MIN_PWM, HOVER_MAX_PWM))
             except Exception:
                 pass
-        self.alt_kp = 20.0
-        self.alt_ki = 2.0
+        self.alt_kp = float(alt_kp)
+        self.alt_ki = float(alt_ki)
         self.alt_i = 0.0
-        self.alt_pwm_max = 150  # +/- around hover
+        self.alt_pwm_max = int(max(10, min(500, alt_pwm_max)))  # +/- around hover
         # persistence helpers
         self._hover_stable_since: Optional[float] = None
         self._last_hover_persist: float = 0.0
@@ -991,6 +1026,15 @@ class Autopilot:
         self.last_hover_err: Optional[float] = None
         self.last_hover_tilt: Optional[float] = None
         self.last_hover_vcell: Optional[float] = None
+        # hover persist/learn configuration
+        self.hover_stable_alt_eps = float(max(0.0, hover_stable_alt_eps))
+        self.hover_stable_vs_eps = float(max(0.0, hover_stable_vs_eps))
+        self.hover_stable_tilt_deg = float(max(0.0, hover_stable_tilt_deg))
+        self.hover_small_adjust_pwm = float(max(0.0, hover_small_adjust_pwm))
+        self.hover_persist_interval_s = float(max(0.05, hover_persist_interval_s))
+        self.hover_stable_dwell_s = float(max(0.0, hover_stable_dwell_s))
+        self.hover_early_alpha = float(max(0.001, min(0.5, hover_early_alpha)))
+        self.hover_early_samples = int(max(0, hover_early_samples))
 
         # takeoff boost
         self.takeoff_boost_pwm = int(max(0, takeoff_boost_pwm))
@@ -1324,20 +1368,20 @@ class Autopilot:
             self._hover_stable_since = None
             return
         # stability conditions
-        stable_alt = abs(err) < 0.05
-        stable_vs = abs(st._altitude_vspeed_mps) < 0.06
-        stable_tilt = (tilt is None) or (abs(tilt) < 10.0)
-        small_adjust = abs(adjust) < 15.0
+        stable_alt = abs(err) < self.hover_stable_alt_eps
+        stable_vs = abs(st._altitude_vspeed_mps) < self.hover_stable_vs_eps
+        stable_tilt = (tilt is None) or (abs(tilt) < self.hover_stable_tilt_deg)
+        small_adjust = abs(adjust) < self.hover_small_adjust_pwm
         if self.mode in (self.MODE_HOLD, self.MODE_TAKEOFF, self.MODE_GOTO) and stable_alt and stable_vs and stable_tilt and small_adjust:
             now = time.time()
             if self._hover_stable_since is None:
                 self._hover_stable_since = now
-            # persist every ~1s after at least 0.8s of stability
-            if (now - self._hover_stable_since) > 0.8 and (now - self._last_hover_persist) > 1.0:
+            # persist after stability dwell and respecting persist interval
+            if (now - self._hover_stable_since) > self.hover_stable_dwell_s and (now - self._last_hover_persist) > self.hover_persist_interval_s:
                 # required hover is close to base = cmd - adjust
                 req_hover = int(clamp(cmd - adjust, HOVER_MIN_PWM, HOVER_MAX_PWM))
                 # speed up early learning
-                a_override = 0.20 if getattr(self.hover_store, 'sample_count', 0) < 10 else None
+                a_override = self.hover_early_alpha if getattr(self.hover_store, 'sample_count', 0) < self.hover_early_samples else None
                 self.hover_store.update_observation(req_hover, tilt, v_cell, alpha_override=a_override)
                 self._last_hover_persist = now
         else:
@@ -1423,6 +1467,9 @@ def main():
     parser.add_argument('--angle-limit', type=float, default=20.0, help='Angle mode limit (deg) used for RC mapping')
     parser.add_argument('--max-tilt', type=float, default=25.0, help='Max commanded tilt (deg) for position control')
     parser.add_argument('--max-speed', type=float, default=5.0, help='Max ground speed target (m/s) for position control (used in damping)')
+    parser.add_argument('--alt-kp', type=float, default=20.0, help='Altitude hold proportional gain')
+    parser.add_argument('--alt-ki', type=float, default=2.0, help='Altitude hold integral gain')
+    parser.add_argument('--alt-pwm-max', type=int, default=150, help='Max absolute PWM adjustment around hover for altitude hold')
     parser.add_argument('--invert-roll', action='store_true', default=True, help='Invert roll command mapping')
     parser.add_argument('--invert-pitch', action='store_true', help='Invert pitch command mapping')
     # Ultrasonic options
@@ -1450,6 +1497,16 @@ def main():
     parser.add_argument('--hover-no-tilt', action='store_true', help='Disable tilt compensation in hover model')
     parser.add_argument('--hover-no-vbat', action='store_true', help='Disable per-cell voltage compensation in hover model')
     parser.add_argument('--hover-runtime-alpha', type=float, default=0.35, help='Runtime blend toward predicted hover (0..1)')
+    # Hover fast adaptation preset and granular controls
+    parser.add_argument('--hover-fast-tune', action='store_true', help='Enable fast hover adaptation preset (overrides conservative defaults)')
+    parser.add_argument('--hover-stable-alt-eps', type=float, default=0.05, help='Altitude error threshold (m) to consider stable for persistence')
+    parser.add_argument('--hover-stable-vs-eps', type=float, default=0.06, help='Vertical speed threshold (m/s) to consider stable for persistence')
+    parser.add_argument('--hover-stable-tilt-deg', type=float, default=10.0, help='Tilt threshold (deg) to consider stable for persistence')
+    parser.add_argument('--hover-small-adjust-pwm', type=float, default=15.0, help='Max |adjust| PWM considered small enough for persistence')
+    parser.add_argument('--hover-persist-interval', type=float, default=1.0, help='Minimum interval (s) between hover persistence updates')
+    parser.add_argument('--hover-stable-dwell', type=float, default=0.8, help='Minimum stability dwell time (s) before persisting')
+    parser.add_argument('--hover-early-alpha', type=float, default=0.20, help='Temporary higher learning rate used for first N samples')
+    parser.add_argument('--hover-early-samples', type=int, default=10, help='Number of early samples to use hover-early-alpha')
     # Battery options
     parser.add_argument('--cells', type=int, default=0, help='Battery cell count (0=auto)')
     parser.add_argument('--low-cell-v', type=float, default=3.55, help='Low-voltage threshold per cell (V) to enable saver mode')
@@ -1460,6 +1517,32 @@ def main():
     parser.add_argument('--no-calibration', action='store_true', help='Skip startup calibration wait')
 
     args = parser.parse_args()
+
+    # Apply fast-tune preset if requested (choose aggressive but safe values)
+    if args.hover_fast_tune:
+        # Blend more aggressively toward predicted hover
+        if args.hover_runtime_alpha < 0.6:
+            args.hover_runtime_alpha = 0.6
+        # Learn base faster
+        if args.hover_alpha < 0.20:
+            args.hover_alpha = 0.20
+        # Loosen stability gates and persist more frequently
+        if args.hover_stable_alt_eps < 0.10:
+            args.hover_stable_alt_eps = 0.10
+        if args.hover_stable_vs_eps < 0.12:
+            args.hover_stable_vs_eps = 0.12
+        if args.hover_stable_tilt_deg < 15.0:
+            args.hover_stable_tilt_deg = 15.0
+        if args.hover_small_adjust_pwm < 25.0:
+            args.hover_small_adjust_pwm = 25.0
+        if args.hover_persist_interval > 0.35:
+            args.hover_persist_interval = 0.35
+        if args.hover_stable_dwell > 0.35:
+            args.hover_stable_dwell = 0.35
+        if args.hover_early_alpha < 0.35:
+            args.hover_early_alpha = 0.35
+        if args.hover_early_samples < 20:
+            args.hover_early_samples = 20
 
     msp = MspClient(
         port=args.port,
@@ -1506,18 +1589,34 @@ def main():
         takeoff_boost_pwm=int(args.takeoff_boost),
         takeoff_boost_time=float(args.takeoff_boost_time),
         hover_runtime_alpha=float(args.hover_runtime_alpha),
+        alt_kp=float(args.alt_kp),
+        alt_ki=float(args.alt_ki),
+        alt_pwm_max=int(args.alt_pwm_max),
+        hover_stable_alt_eps=float(args.hover_stable_alt_eps),
+        hover_stable_vs_eps=float(args.hover_stable_vs_eps),
+        hover_stable_tilt_deg=float(args.hover_stable_tilt_deg),
+        hover_small_adjust_pwm=float(args.hover_small_adjust_pwm),
+        hover_persist_interval_s=float(args.hover_persist_interval),
+        hover_stable_dwell_s=float(args.hover_stable_dwell),
+        hover_early_alpha=float(args.hover_early_alpha),
+        hover_early_samples=int(args.hover_early_samples),
     )
 
     try:
         store_val = getattr(hover_store, 'base_hover_pwm', None)
         print(f"[MAIN] Hover model init: base={store_val if store_val is not None else 'None'} vref={hover_store.vcell_ref:.2f}V slope={hover_store.slope_pwm_per_v:.2f} pwm/V sample_count={hover_store.sample_count}")
         print(f"[MAIN] Hover runtime alpha={ap.hover_runtime_alpha:.2f} learn alpha={hover_store.alpha:.2f} persist={'on' if hover_store.enabled else 'off'} file={hover_store.path}")
+        print(f"[MAIN] Hover persist cfg: alt_eps={ap.hover_stable_alt_eps:.2f}m vs_eps={ap.hover_stable_vs_eps:.2f}m/s tilt<{ap.hover_stable_tilt_deg:.1f}deg small_adj<{ap.hover_small_adjust_pwm:.0f} pwm dwell={ap.hover_stable_dwell_s:.2f}s interval={ap.hover_persist_interval_s:.2f}s early_alpha={ap.hover_early_alpha:.2f} early_n={ap.hover_early_samples}")
+        print(f"[MAIN] Altitude PID: kp={ap.alt_kp:.2f} ki={ap.alt_ki:.2f} clamp=±{ap.alt_pwm_max} pwm")
     except Exception:
         pass
 
     # Telemetry helpers
     telem_thread = None
     telem_stop = threading.Event()
+    # Command console (stdin) helpers
+    cmd_thread = None
+    cmd_stop = threading.Event()
 
     try:
         # Telemetry background thread (start early so we can observe calibration)
@@ -1581,6 +1680,45 @@ def main():
             if args.telemetry_hover:
                 modes.append("HOVER")
             print(f"[MAIN] Telemetry enabled: {', '.join(modes)}")
+
+        # Start command console (stdin) to allow runtime commands (e.g., hover reset)
+        def _cmd_loop():
+            while not cmd_stop.is_set():
+                try:
+                    line = sys.stdin.readline()
+                except Exception:
+                    time.sleep(0.5)
+                    continue
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                cmd = line.strip()
+                if not cmd:
+                    continue
+                if cmd in ("help", "?"):
+                    print("[CMD] Commands: 'hover reset [BASE]'")
+                    continue
+                if cmd.startswith("hover reset"):
+                    parts = cmd.split()
+                    base = None
+                    if len(parts) >= 3:
+                        try:
+                            base = int(parts[2])
+                        except Exception:
+                            base = None
+                    baseline = base if base is not None else args.hover_baseline
+                    try:
+                        hover_store.reset_model(baseline_hint=baseline, save=True)
+                        ap.hover_pwm = int(clamp(hover_store.get(PWM_MID), HOVER_MIN_PWM, HOVER_MAX_PWM))
+                        ap.alt_i = 0.0
+                        print(f"[CMD] Hover model reset: base={hover_store.base_hover_pwm} vref={hover_store.vcell_ref:.2f}V slope={hover_store.slope_pwm_per_v:.2f} samp={hover_store.sample_count}")
+                    except Exception as e:
+                        print(f"[CMD] Hover reset failed: {e}")
+                    continue
+                print(f"[CMD] Unknown command: {cmd}")
+        cmd_thread = threading.Thread(target=_cmd_loop, daemon=True)
+        cmd_thread.start()
+        print("[MAIN] Command console ready. Type 'help' for commands.")
 
         # Calibration (default): wait a couple seconds for sensors/bias to settle
         if not args.no_calibration:
@@ -1679,6 +1817,15 @@ def main():
             if telem_thread is not None:
                 telem_stop.set()
                 telem_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if cmd_thread is not None:
+                cmd_stop.set()
+                try:
+                    cmd_thread.join(timeout=0.5)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
