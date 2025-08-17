@@ -290,12 +290,41 @@ def bearing_deg(from_lat: float, from_lon: float, to_lat: float, to_lon: float) 
 # Hover Persistence
 # ------------------------
 class HoverStore:
-    def __init__(self, path: Optional[str] = None, enabled: bool = True):
+    def __init__(self, path: Optional[str] = None, enabled: bool = True,
+                 baseline_hint: Optional[int] = None,
+                 reset: bool = False,
+                 alpha: float = 0.06,
+                 use_tilt_comp: bool = True,
+                 use_vbat_comp: bool = True,
+                 vcell_ref: Optional[float] = None):
         self.path = path or HOVER_PERSIST_DEFAULT_PATH
         self.enabled = bool(enabled)
+        # Learning settings
+        self.alpha = max(0.001, min(0.5, float(alpha)))  # EMA rate for base hover
+        self.use_tilt_comp = bool(use_tilt_comp)
+        self.use_vbat_comp = bool(use_vbat_comp)
+        # Model state (persisted)
+        self.base_hover_pwm: Optional[int] = None  # nominal hover at 0 deg tilt, mid battery
+        self.vcell_ref: float = 3.80               # reference per-cell voltage
+        self.slope_pwm_per_v: float = 0.0          # compensation slope per volt per cell
+        self.sample_count: int = 0
+        # Back-compat single value
         self.value: Optional[int] = None
+        # Runtime
         self.last_save: float = 0.0
-        self._load()
+        self.version: int = 1
+        # Initialize
+        if not reset:
+            self._load()
+        if vcell_ref is not None:
+            try:
+                self.vcell_ref = float(vcell_ref)
+            except Exception:
+                pass
+        if self.base_hover_pwm is None:
+            # prefer hint if provided else fallback to old value or 1500
+            init = baseline_hint if baseline_hint is not None else (self.value if self.value is not None else 1500)
+            self.base_hover_pwm = int(clamp(int(init), HOVER_MIN_PWM, HOVER_MAX_PWM))
 
     def _load(self):
         if not self.enabled:
@@ -303,29 +332,96 @@ class HoverStore:
         try:
             with open(self.path, 'r') as f:
                 data = json.load(f)
-            v = int(data.get('hover_pwm', 0))
-            if v > 0:
-                self.value = int(clamp(v, HOVER_MIN_PWM, HOVER_MAX_PWM))
+            # Backward compat single value
+            if 'hover_pwm' in data and isinstance(data['hover_pwm'], (int, float)):
+                v = int(data['hover_pwm'])
+                if v > 0:
+                    self.value = int(clamp(v, HOVER_MIN_PWM, HOVER_MAX_PWM))
+            # New model fields
+            self.version = int(data.get('version', 1))
+            bh = data.get('base_hover_pwm')
+            if isinstance(bh, (int, float)):
+                self.base_hover_pwm = int(clamp(int(bh), HOVER_MIN_PWM, HOVER_MAX_PWM))
+            vr = data.get('vcell_ref')
+            if isinstance(vr, (int, float)):
+                self.vcell_ref = float(vr)
+            sl = data.get('slope_pwm_per_v')
+            if isinstance(sl, (int, float)):
+                self.slope_pwm_per_v = float(sl)
+            sc = data.get('sample_count')
+            if isinstance(sc, int):
+                self.sample_count = max(0, sc)
+            stg = data.get('settings', {})
+            if isinstance(stg, dict):
+                self.use_tilt_comp = bool(stg.get('use_tilt_comp', self.use_tilt_comp))
+                self.use_vbat_comp = bool(stg.get('use_vbat_comp', self.use_vbat_comp))
+                a = stg.get('alpha')
+                if isinstance(a, (int, float)):
+                    self.alpha = max(0.001, min(0.5, float(a)))
         except Exception:
             # ignore load errors
             pass
 
     def get(self, default_pwm: int) -> int:
+        # Return base hover (no compensation), used for initialization
+        if self.enabled and (self.base_hover_pwm is not None):
+            return int(self.base_hover_pwm)
         if self.enabled and (self.value is not None):
             return int(self.value)
         return int(default_pwm)
 
-    def update(self, new_pwm: int, st: DroneState):
+    def predict(self, tilt_deg: Optional[float], v_cell: Optional[float]) -> int:
+        base = int(self.get(PWM_MID))
+        # Tilt compensation: divide by cos(tilt)
+        if self.use_tilt_comp and tilt_deg is not None:
+            t = max(0.0, float(tilt_deg))
+            c = math.cos(math.radians(min(60.0, t)))
+            c = max(0.6, c)  # avoid excessive boost
+            base = int(round(base / c))
+        # Battery compensation around reference
+        if self.use_vbat_comp and v_cell is not None and abs(self.slope_pwm_per_v) > 1e-6:
+            base = int(round(base + self.slope_pwm_per_v * (float(v_cell) - float(self.vcell_ref))))
+        return int(clamp(base, HOVER_MIN_PWM, HOVER_MAX_PWM))
+
+    def update_observation(self, required_hover_pwm: int,
+                           tilt_deg: Optional[float],
+                           v_cell: Optional[float],
+                           alpha_override: Optional[float] = None):
         if not self.enabled:
             return
-        new_pwm = int(clamp(new_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
-        if self.value is None:
-            self.value = new_pwm
+        # Bring required back to base (0 tilt, ref voltage)
+        base_est = int(clamp(required_hover_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
+        # Remove battery bias
+        if self.use_vbat_comp and v_cell is not None:
+            dv = float(v_cell) - float(self.vcell_ref)
+            base_est = int(round(base_est - self.slope_pwm_per_v * dv))
+        # Remove tilt effect
+        if self.use_tilt_comp and tilt_deg is not None:
+            t = max(0.0, float(tilt_deg))
+            c = math.cos(math.radians(min(60.0, t)))
+            c = max(0.6, c)
+            base_est = int(round(base_est * c))
+        # EMA update of base
+        a = self.alpha if alpha_override is None else max(0.001, min(0.5, float(alpha_override)))
+        if self.base_hover_pwm is None:
+            self.base_hover_pwm = base_est
         else:
-            alpha = 0.2  # persistence smoothing
-            self.value = int(round((1.0 - alpha) * self.value + alpha * new_pwm))
+            self.base_hover_pwm = int(round((1.0 - a) * self.base_hover_pwm + a * base_est))
+        self.base_hover_pwm = int(clamp(self.base_hover_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
+        self.sample_count += 1
+        # Gentle update of battery slope if voltage offset is significant
+        if self.use_vbat_comp and v_cell is not None:
+            dv = float(v_cell) - float(self.vcell_ref)
+            if abs(dv) > 0.03:
+                # target slope that would make base_est closer to base_hover
+                err = float(self.base_hover_pwm) - float(base_est)
+                alpha_s = 0.02
+                self.slope_pwm_per_v = float(self.slope_pwm_per_v) + alpha_s * (err / dv)
+                # constrain slope to sane bounds
+                self.slope_pwm_per_v = max(-200.0, min(200.0, self.slope_pwm_per_v))
+        # opportunistically save
         now = time.time()
-        if now - self.last_save > 2.0:
+        if now - self.last_save > 1.0:
             self._save()
 
     def _save(self):
@@ -335,8 +431,24 @@ class HoverStore:
             ddir = os.path.dirname(self.path)
             if ddir and not os.path.exists(ddir):
                 os.makedirs(ddir, exist_ok=True)
+            payload = {
+                'version': self.version,
+                # Back-compat field
+                'hover_pwm': int(self.base_hover_pwm or self.value or 0),
+                # Model
+                'base_hover_pwm': int(self.base_hover_pwm or 0),
+                'vcell_ref': float(self.vcell_ref),
+                'slope_pwm_per_v': float(self.slope_pwm_per_v),
+                'sample_count': int(self.sample_count),
+                'updated': time.time(),
+                'settings': {
+                    'alpha': float(self.alpha),
+                    'use_tilt_comp': bool(self.use_tilt_comp),
+                    'use_vbat_comp': bool(self.use_vbat_comp),
+                }
+            }
             with open(self.path, 'w') as f:
-                json.dump({'hover_pwm': int(self.value or 0), 'updated': time.time()}, f)
+                json.dump(payload, f)
             self.last_save = time.time()
         except Exception:
             # ignore save errors
@@ -822,7 +934,8 @@ class Autopilot:
                  manual: Optional[ManualController] = None,
                  hover_store: Optional[HoverStore] = None,
                  takeoff_boost_pwm: int = 80,
-                 takeoff_boost_time: float = 0.7):
+                 takeoff_boost_time: float = 0.7,
+                 hover_runtime_alpha: float = 0.20):
         self.msp = msp
         self.angle_limit_deg = max(5.0, min(85.0, angle_limit_deg))
         self.max_tilt_deg = max(5.0, min(self.angle_limit_deg, max_tilt_deg))
@@ -831,6 +944,7 @@ class Autopilot:
         self.invert_pitch = invert_pitch
         self.manual = manual
         self.hover_store = hover_store
+        self.hover_runtime_alpha = max(0.01, min(1.0, float(hover_runtime_alpha)))
         # Sticky manual takeover flag: once True, autonomous stays disabled until restart
         self.sticky_manual = False
 
@@ -856,7 +970,7 @@ class Autopilot:
         self._land_touchdown_start: Optional[float] = None
 
         # altitude control
-        # initialize hover from store if provided
+        # initialize hover from store base (no comp)
         self.hover_pwm = 1500
         if self.hover_store is not None:
             try:
@@ -870,6 +984,13 @@ class Autopilot:
         # persistence helpers
         self._hover_stable_since: Optional[float] = None
         self._last_hover_persist: float = 0.0
+        # telemetry last values for hover estimator (for printing)
+        self.last_hover_pred: Optional[int] = None
+        self.last_hover_cmd: Optional[int] = None
+        self.last_hover_adjust: Optional[float] = None
+        self.last_hover_err: Optional[float] = None
+        self.last_hover_tilt: Optional[float] = None
+        self.last_hover_vcell: Optional[float] = None
 
         # takeoff boost
         self.takeoff_boost_pwm = int(max(0, takeoff_boost_pwm))
@@ -1154,7 +1275,23 @@ class Autopilot:
         # If no altitude, hold last throttle (or hover)
         if st.altitude_m is None or self.target_alt_m is None:
             return int(clamp(self.hover_pwm, PWM_MIN, PWM_MAX))
+        # compute current tilt and vcell
+        tilt = None
+        if st.roll_deg is not None and st.pitch_deg is not None:
+            try:
+                tilt = (st.roll_deg ** 2 + st.pitch_deg ** 2) ** 0.5
+            except Exception:
+                tilt = None
+        v_cell = None
+        if st.vbat_v is not None:
+            cells = st.get_cells()
+            if cells and cells > 0:
+                v_cell = st.vbat_v / float(cells)
         err = self.target_alt_m - st.altitude_m
+        # record for telemetry
+        self.last_hover_tilt = tilt
+        self.last_hover_vcell = v_cell
+        self.last_hover_err = float(err)
         # integral with anti-windup
         self.alt_i = clamp(self.alt_i + err * 0.01, -100.0, 100.0)
         adjust = self.alt_kp * err + self.alt_ki * self.alt_i
@@ -1162,15 +1299,25 @@ class Autopilot:
         # landing bias to ensure descent
         if landing:
             adjust = clamp(adjust - 50, -self.alt_pwm_max, self.alt_pwm_max)
+        self.last_hover_adjust = float(adjust)
+        # Predict baseline hover (feedforward) and adapt quickly toward it
+        if self.hover_store is not None:
+            try:
+                pred = self.hover_store.predict(tilt, v_cell)
+                self.last_hover_pred = int(pred)
+                self.hover_pwm = int(round((1.0 - self.hover_runtime_alpha) * self.hover_pwm + self.hover_runtime_alpha * pred))
+                self.hover_pwm = int(clamp(self.hover_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
+            except Exception:
+                pass
+        # Compose final throttle
         cmd = int(clamp(self.hover_pwm + adjust, PWM_MIN, PWM_MAX))
-        # hover estimator: slowly adapt so that on average adjust -> 0
-        self.hover_pwm = int(clamp(0.999 * self.hover_pwm + 0.001 * cmd, HOVER_MIN_PWM, HOVER_MAX_PWM))
-        # persist hover if stable around target (not during landing)
+        self.last_hover_cmd = int(cmd)
+        # Learn/persist hover when stable (not during landing)
         if not landing:
-            self._maybe_persist_hover(st, err)
+            self._maybe_persist_hover(st, err, tilt=tilt, v_cell=v_cell, cmd=cmd, adjust=adjust)
         return cmd
 
-    def _maybe_persist_hover(self, st: DroneState, err: float):
+    def _maybe_persist_hover(self, st: DroneState, err: float, tilt: Optional[float], v_cell: Optional[float], cmd: int, adjust: float):
         if self.hover_store is None:
             return
         if st.altitude_m is None or self.target_alt_m is None:
@@ -1179,13 +1326,19 @@ class Autopilot:
         # stability conditions
         stable_alt = abs(err) < 0.05
         stable_vs = abs(st._altitude_vspeed_mps) < 0.06
-        if self.mode in (self.MODE_HOLD, self.MODE_TAKEOFF, self.MODE_GOTO) and stable_alt and stable_vs:
+        stable_tilt = (tilt is None) or (abs(tilt) < 10.0)
+        small_adjust = abs(adjust) < 15.0
+        if self.mode in (self.MODE_HOLD, self.MODE_TAKEOFF, self.MODE_GOTO) and stable_alt and stable_vs and stable_tilt and small_adjust:
             now = time.time()
             if self._hover_stable_since is None:
                 self._hover_stable_since = now
             # persist every ~1s after at least 0.8s of stability
             if (now - self._hover_stable_since) > 0.8 and (now - self._last_hover_persist) > 1.0:
-                self.hover_store.update(self.hover_pwm, st)
+                # required hover is close to base = cmd - adjust
+                req_hover = int(clamp(cmd - adjust, HOVER_MIN_PWM, HOVER_MAX_PWM))
+                # speed up early learning
+                a_override = 0.20 if getattr(self.hover_store, 'sample_count', 0) < 10 else None
+                self.hover_store.update_observation(req_hover, tilt, v_cell, alpha_override=a_override)
                 self._last_hover_persist = now
         else:
             self._hover_stable_since = None
@@ -1282,12 +1435,21 @@ def main():
     # Telemetry options
     parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (altitude, vspeed, battery)')
     parser.add_argument('--telemetry-rc', action='store_true', help='Print live RC values sent to FC (roll, pitch, throttle, yaw, AUX)')
+    parser.add_argument('--telemetry-hover', action='store_true', help='Print hover estimator telemetry (pred/base/slope/vref/tilt/vcell/err/adjust/cmd)')
     parser.add_argument('--debug-msp', action='store_true', help='Verbose MSP debug (checksum drops, first samples)')
     # Hover persistence and takeoff boost
     parser.add_argument('--no-hover-persist', action='store_true', help='Disable saving/loading learned hover throttle')
     parser.add_argument('--hover-file', type=str, default=HOVER_PERSIST_DEFAULT_PATH, help='Path to store learned hover throttle (JSON)')
     parser.add_argument('--takeoff-boost', type=int, default=80, help='Extra PWM added above hover during initial takeoff window')
     parser.add_argument('--takeoff-boost-time', type=float, default=0.7, help='Duration (s) to apply takeoff boost window')
+    # Hover model controls
+    parser.add_argument('--hover-baseline', type=int, default=None, help='Baseline hover PWM hint (e.g., 1500)')
+    parser.add_argument('--hover-reset', action='store_true', help='Reset stored hover model on startup')
+    parser.add_argument('--hover-alpha', type=float, default=0.08, help='Learning rate (EMA) for base hover model (0.001..0.5)')
+    parser.add_argument('--hover-vref', type=float, default=None, help='Reference per-cell voltage (V) for compensation (default 3.80V)')
+    parser.add_argument('--hover-no-tilt', action='store_true', help='Disable tilt compensation in hover model')
+    parser.add_argument('--hover-no-vbat', action='store_true', help='Disable per-cell voltage compensation in hover model')
+    parser.add_argument('--hover-runtime-alpha', type=float, default=0.35, help='Runtime blend toward predicted hover (0..1)')
     # Battery options
     parser.add_argument('--cells', type=int, default=0, help='Battery cell count (0=auto)')
     parser.add_argument('--low-cell-v', type=float, default=3.55, help='Low-voltage threshold per cell (V) to enable saver mode')
@@ -1321,7 +1483,16 @@ def main():
         except Exception as e:
             print(f"[MAIN] Manual controller disabled: {e}")
 
-    hover_store = HoverStore(path=args.hover_file, enabled=(not args.no_hover_persist))
+    hover_store = HoverStore(
+        path=args.hover_file,
+        enabled=(not args.no_hover_persist),
+        baseline_hint=args.hover_baseline,
+        reset=bool(args.hover_reset),
+        alpha=float(args.hover_alpha),
+        use_tilt_comp=(not args.hover_no_tilt),
+        use_vbat_comp=(not args.hover_no_vbat),
+        vcell_ref=args.hover_vref,
+    )
 
     ap = Autopilot(
         msp,
@@ -1334,11 +1505,13 @@ def main():
         hover_store=hover_store,
         takeoff_boost_pwm=int(args.takeoff_boost),
         takeoff_boost_time=float(args.takeoff_boost_time),
+        hover_runtime_alpha=float(args.hover_runtime_alpha),
     )
 
     try:
-        store_val = hover_store.value
-        print(f"[MAIN] Hover PWM init: {ap.hover_pwm} (store={store_val if store_val is not None else 'None'})")
+        store_val = getattr(hover_store, 'base_hover_pwm', None)
+        print(f"[MAIN] Hover model init: base={store_val if store_val is not None else 'None'} vref={hover_store.vcell_ref:.2f}V slope={hover_store.slope_pwm_per_v:.2f} pwm/V sample_count={hover_store.sample_count}")
+        print(f"[MAIN] Hover runtime alpha={ap.hover_runtime_alpha:.2f} learn alpha={hover_store.alpha:.2f} persist={'on' if hover_store.enabled else 'off'} file={hover_store.path}")
     except Exception:
         pass
 
@@ -1348,7 +1521,7 @@ def main():
 
     try:
         # Telemetry background thread (start early so we can observe calibration)
-        if args.telemetry or args.telemetry_rc:
+        if args.telemetry or args.telemetry_rc or args.telemetry_hover:
             def _telem_loop():
                 while not telem_stop.is_set():
                     if args.telemetry:
@@ -1377,10 +1550,37 @@ def main():
                         aux1 = rc[AUX_ARM_CH] if len(rc) > AUX_ARM_CH else PWM_MIN
                         aux2 = rc[5] if len(rc) > 5 else PWM_MIN
                         print(f"[RC ] roll={r} pitch={p} thr={t} yaw={y} aux1={aux1} aux2={aux2}")
+                    if args.telemetry_hover:
+                        try:
+                            hs = hover_store
+                            pred = ap.last_hover_pred
+                            cmd = ap.last_hover_cmd
+                            adj = ap.last_hover_adjust
+                            err = ap.last_hover_err
+                            tilt = ap.last_hover_tilt
+                            vcell = ap.last_hover_vcell
+                            base = getattr(hs, 'base_hover_pwm', None)
+                            slope = getattr(hs, 'slope_pwm_per_v', 0.0)
+                            vref = getattr(hs, 'vcell_ref', 0.0)
+                            sc = getattr(hs, 'sample_count', 0)
+                            def _fmti(x):
+                                return "None" if x is None else str(int(x))
+                            def _fmtf(x):
+                                return "None" if x is None else f"{float(x):.2f}"
+                            print(f"[HOV] pred={_fmti(pred)} base={_fmti(base)} cmd={_fmti(cmd)} adj={_fmtf(adj)} err={_fmtf(err)} tilt={_fmtf(tilt)} vcell={_fmtf(vcell)} vref={_fmtf(vref)} slope={_fmtf(slope)} samp={sc}")
+                        except Exception:
+                            pass
                     time.sleep(0.2)
             telem_thread = threading.Thread(target=_telem_loop, daemon=True)
             telem_thread.start()
-            print("[MAIN] Telemetry enabled" + (" (RC)" if args.telemetry_rc and not args.telemetry else ""))
+            modes = []
+            if args.telemetry:
+                modes.append("SENSORS")
+            if args.telemetry_rc:
+                modes.append("RC")
+            if args.telemetry_hover:
+                modes.append("HOVER")
+            print(f"[MAIN] Telemetry enabled: {', '.join(modes)}")
 
         # Calibration (default): wait a couple seconds for sensors/bias to settle
         if not args.no_calibration:
