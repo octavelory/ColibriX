@@ -609,7 +609,16 @@ class MspClient:
         with self._lock:
             if cmd == MSP_ALTITUDE and len(payload) >= 4:
                 alt_cm = struct.unpack('<i', payload[0:4])[0]
-                self.state.update_baro_alt(float(alt_cm) / 100.0)
+                alt_m = float(alt_cm) / 100.0
+                # If ultrasonic is unavailable, adapt baro bias while disarmed to peg ground at 0
+                try:
+                    if (self._ultra is None) and (not self._is_armed()):
+                        # Fast convergence on very first alt, then slow tracking
+                        a = 0.20 if not self._got_first_alt else BARO_BIAS_ALPHA
+                        self.state.baro_bias_m = (1.0 - a) * self.state.baro_bias_m + a * alt_m
+                except Exception:
+                    pass
+                self.state.update_baro_alt(alt_m)
                 self._got_first_alt = True
             elif cmd == MSP_RAW_GPS and len(payload) >= 16:
                 fix = payload[0] != 0
@@ -737,6 +746,14 @@ class MspClient:
         """Return a copy of the last RC values sent to the FC (8 channels)."""
         with self._lock:
             return list(self.rc_values)
+
+    def _is_armed(self) -> bool:
+        """Heuristic: consider armed if AUX arm channel is high."""
+        with self._lock:
+            try:
+                return self.rc_values[AUX_ARM_CH] >= AUX_ARM_HIGH
+            except Exception:
+                return False
 
 
 # ------------------------
