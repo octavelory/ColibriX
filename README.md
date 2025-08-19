@@ -1,180 +1,156 @@
-# ColibriX
+# ColibriX Betaflight Autopilot (Altitude Hold)
 
-A low-cost, autonomous micro‑delivery drone prototype built on Raspberry Pi + Betaflight (MSP), designed to make point‑to‑point deliveries over short distances with a simple, user‑friendly workflow. The system emphasizes accessibility, openness, and pragmatic reliability over camera-first features or proprietary infrastructure.
+A simple Python autopilot for Betaflight that can take off to a target altitude, hold it steadily, and land on command. It reads the drone’s altitude and GPS via MSP and sends RC commands back to Betaflight. You can override at any time with a joystick or by disarming.
 
-Author: Octave
-Site + 3D viewer: https://colibrix.vercel.app/ — 3D: https://colibrix.vercel.app/viewer
 
----
+## Plain-English Overview
 
-## TL;DR
-- Purpose: autonomous last‑meter courier drone delivering small payloads quickly in hard‑to‑reach areas.
-- Cost target: ~200 € prototype using commodity parts and open-source firmware.
-- Stack: Raspberry Pi, Betaflight FC (MSP over serial), GPS, optional ultrasonic, Python controllers.
-- Modes: arm/disarm, takeoff, altitude/position hold, goto(lat/lon), land, geofence.
-- Current limitations: no return‑to‑home yet, weather limits, prototype frame without fairing.
+- You plug in your Betaflight quad via USB.
+- Run `autopilot.py` and press:
+  - `a` to arm
+  - `t` to take off to a set height and hover
+  - `h` to hold your current height
+  - `l` to land
+  - `z` to re-zero altitude reference
+  - `q` to quit (disarms first)
+- If you move a joystick (optional), the script immediately gives control back to you and stays in manual until you explicitly choose an auto mode again.
+- It’s designed to be safe: it won’t rise aggressively when it can’t read altitude, clamps throttle, and disarms on exit.
 
----
+You don’t need to understand MSP or control theory to use it—just the keys above. Start with props off to get familiar and tune one parameter (hover power) so it knows roughly how much throttle to hover.
 
-## Why ColibriX is different
-- Not a camera drone (DJI‑style): built for transport, not filming. UI goal: pick a point B and go.
-- Not FPV: removes the pilot; favors autonomy, predictability, and ease of use.
-- Not an industrial black box: open, modular, affordable; suitable for small shops, makers, schools.
 
----
+## Features (What it does exactly)
 
-## Repository structure
-- `autonomous_drone.py`: MSP client + sensor fusion + autonomous `Autopilot` (takeoff/hold/goto/land) and safety (geofence, checks).
-- `demo_mission.py`: example mission runner using `Autopilot` (dry‑run by default; `--execute` to fly).
-- `remote_control.py`: joystick‑driven manual control over MSP with a rich terminal UI; basic auto helpers, camera servo control.
-- `control_camera_tower.py`: standalone camera gimbal control with joystick and smooth servo motion.
-- `test_buttons.py`: quick joystick event visualizer for mapping buttons/axes.
+- High-level altitude control
+  - Auto takeoff to a target altitude, hover (alt-hold), and land.
+  - Flight states: `MANUAL`, `TAKEOFF`, `HOLD`, `LAND`.
+- Sensor fusion and relative altitude
+  - Reads barometer altitude (`MSP_ALTITUDE`) and GPS (`MSP_RAW_GPS`).
+  - Smart relative zeroing (baseline/bias) for both baro and GPS so altitude is treated as “relative to now”.
+  - Optional blending of GPS altitude with baro (configurable weight) and smoothing filter.
+- Throttle PI controller
+  - Simple PI controller adjusts throttle around a configurable hover PWM.
+  - Gains and integral clamp are configurable.
+- Immediate manual override
+  - Optional joystick input (pygame). Any stick or button latches manual mode.
+  - While latched, the script does not fight your inputs; You are fully in control.
+  - Press auto keys again (e.g., `t` or `h`) to resume autonomous modes.
+- Yaw lock (optional)
+  - Keeps yaw centered unless disabled.
+- Robust MSP/RC output
+  - Uses `MSP_SET_RAW_RC` to send RC commands at ~50 Hz.
+  - Graceful disarm and throttle cut on exit.
+- Windows-friendly serial autodetect
+  - Auto-detects likely COM ports; also works on Linux.
+- Safety behavior
+  - If altitude is missing mid-flight, holds near-hover throttle conservatively.
+  - Clamps throttle range. Disarms on exit.
 
----
 
-## Hardware (prototype)
-- Flight controller: Betaflight (tested with SpeedyBee F405 AIO; MSP @ 115200 baud).
-- Compute: Raspberry Pi (runs Python + MSP + optional ultrasonic via GPIO).
-- Sensors: GPS (MSP_RAW_GPS), barometer (MSP_ALTITUDE), attitude (MSP_ATTITUDE), optional ultrasonic (HC‑SR04 class).
-- Frame: quadcopter prototype, no fairing yet; payload sling underframe.
+## Requirements
 
-Notes
-- FC mounting had to be rotated ~45° due to mismatched holes (compensated in software/firmware config).
-- Barometer can benefit from a fairing to reduce prop wash pressure errors.
+- Python 3.8+
+- pyserial (required)
+- pygame (optional, only for joystick override)
 
----
+Install:
 
-## Software prerequisites
-- Python 3.9+
-- Packages: `pyserial`, `pygame`, `gpiozero` (Pi only)
-
-Example installation
 ```bash
-pip install pyserial pygame gpiozero
+pip install pyserial pygame
 ```
 
-Platform notes
-- `gpiozero` and ultrasonic/servo features require Raspberry Pi GPIO. On desktop (Windows/macOS/Linux), use only MSP features.
-- Serial ports: Pi: `/dev/ttyAMA0`, `/dev/ttyS0` (autodetected). Windows: typically `COM3`.
 
----
+## Betaflight Setup Notes
+
+- ARM on `AUX1` (or adjust in code if you use a different channel).
+- Angle/Level mode recommended for simple hovering.
+- Barometer enabled/working. GPS optional (used for altitude blend if present).
+- Connect via USB or serial that exposes MSP.
+
 
 ## Usage
 
-### 1) Autonomous control (low-level CLI)
-`autonomous_drone.py` offers direct commands over MSP.
-
-Examples
-```bash
-python autonomous_drone.py --arm
-python autonomous_drone.py --takeoff 1.5
-python autonomous_drone.py --goto 48.85837 2.29448 --alt 5 --safe-alt 8 --geofence 200
-python autonomous_drone.py --land
-```
-
-Key options (selection)
-- `--port`: serial port (auto on Pi; e.g. `COM3` on Windows)
-- `--alt`, `--safe-alt`, `--geofence`: altitude target, cruise safety altitude, radius geofence
-- `--ultra/--no-ultra`: enable/disable ultrasonic fusion (if supported)
-- `--telemetry`: print live telemetry including altitude fusion and battery metrics
-- Battery configuration and safety thresholds:
-  - `--cells N`: battery cell count (0 = auto)
-  - `--low-cell-v V`: low-voltage per-cell threshold (default 3.55 V) -> enables battery saver (reduced tilt/speed)
-  - `--crit-cell-v V`: critical per-cell threshold (default 3.40 V) -> triggers forced landing
-  - `--boot-cell-v V`: minimum per-cell at startup (default 3.50 V) -> blocks startup if below
-  - `--skip-batt-check`: skip the startup battery check (not recommended)
-- Calibration:
-  - By default, a short calibration wait (~2s) lets sensors settle.
-  - `--no-calibration` to skip.
-
-### 2) Demo mission
-`demo_mission.py` shows a mini‑mission using `Autopilot`.
-
-Dry‑run (prints plan only)
-```bash
-python demo_mission.py
-```
-Execute (send RC over MSP)
-```bash
-python demo_mission.py --port COM3 --execute
-```
-Options include: `--takeoff`, `--safe-alt`, `--geofence`, `--angle-limit`, `--max-tilt`, `--max-speed`.
-
-### 3) Manual joystick control + camera servos
-`remote_control.py` provides a terminal UI with joystick input, arm/disarm, ALTHOLD toggle, yaw lock, and camera servo mode.
+- Dry run (no serial, safe to try):
 
 ```bash
-python remote_control.py
+python autopilot.py --dry-run -v
 ```
-Highlights
-- Arm/disarm safety (throttle must be low)
-- Altitude readout via MSP, GPS status, channel visualization
-- Camera mode: right stick controls two servos with smoothing (requires Pi + GPIO)
 
-### 4) Camera tower only
+- Typical run (auto-detect port):
+
 ```bash
-python control_camera_tower.py
+python autopilot.py --target-alt 1.5 --hover-pwm 1550 -v
 ```
-- Smooth joystick control for two servos (Pi + GPIO).
 
-### 5) Joystick tester
+- With joystick manual override:
+
 ```bash
-python test_buttons.py
+python autopilot.py --joystick --joy-deadzone 0.08
 ```
-- Prints live button/axis/hat events to help map your device.
 
----
+- Useful options:
+  - `--port COM5` or `/dev/ttyUSB0` to force a port.
+  - `--gps-weight 0.0..1.0` blend GPS altitude with baro (baro primary by default).
+  - `--bias-on startup|arm|takeoff|never` when to zero the altitude reference.
+  - `--alt-lpf 0.0..1.0` smoothing factor for altitude (0 disables smoothing).
+  - `--no-yaw-lock` to allow yaw control in auto modes.
+  - `--kp`, `--ki`, `--imax` PI controller gains/clamp.
 
-## How it works (high level)
+Keyboard controls shown at startup:
 
-- MSP transport: `MspClient` encapsulates MSP framing, periodic polling of `MSP_ALTITUDE`, `MSP_RAW_GPS`, `MSP_ATTITUDE`, `MSP_ANALOG` (battery), and RC outputs via `MSP_SET_RAW_RC`.
-- Sensor fusion: `DroneState` fuses baro altitude with optional ultrasonic using a smooth blend near the ultrasonic’s range limit, plus a slow baro bias calibration near ground.
-- Autopilot: `Autopilot` runs in a control loop with modes `IDLE/TAKEOFF/HOLD/GOTO/LAND`. It implements:
-  - Altitude PI around a slowly adapting hover PWM estimator
-  - Heading hold (proportional yaw)
-  - Position control (meters error -> tilt angles -> RC) with velocity damping from GPS ground speed
-  - Geofence check vs home if available
+- `a` Arm/Disarm
+- `t` Auto takeoff to `--target-alt` then HOLD
+- `h` Hold current altitude
+- `l` Land
+- `+` / `-` or `w` / `s` Adjust target altitude by ±0.1 m
+- `z` Zero altitude reference now
+- `q` Quit (disarm & exit)
 
-Key classes/functions
-- `autonomous_drone.py`: `MspClient`, `Autopilot`, `DroneState`, helpers like `meters_per_deg_lat()`, `meters_per_deg_lon()`
-- `demo_mission.py`: `compute_waypoints_around_home()`, `wait_for_altitude()`, `wait_until_close_to()`
 
----
+## Joystick (optional)
 
-## Current limitations and safety
-- No automatic Return‑to‑Home yet.
-- Battery monitoring and policy (prototype):
-  - Battery telemetry via MSP `MSP_ANALOG` provides pack voltage, current, and mAh.
-  - Startup safety: by default, the CLI blocks operation if the per‑cell voltage is below `--boot-cell-v` (default 3.50 V). Use `--skip-batt-check` to override.
-  - In flight:
-    - Low per‑cell voltage (< `--low-cell-v`, default 3.55 V): battery saver mode reduces max tilt and max speed.
-    - Critical per‑cell voltage (< `--crit-cell-v`, default 3.40 V): automatic forced landing.
-  - Battery cell count can be set (`--cells`) or auto‑detected from pack voltage.
-- Weather: not water‑proof; wind not yet stress‑tested.
-- Failures: if the Pi stack fails, FC can still stabilize but without obstacle avoidance. FC failure = crash (never observed during tests).
+- Enable with `--joystick` (requires pygame).
+- Any stick motion or button press latches MANUAL override (the script stops commanding throttle/attitude).
+- Button LB/L1 toggles Arm/Disarm (configurable in code: `BUTTON_ARM_DISARM = 4`).
+- Axes mapping (mirrors `remote_control.py`):
+  - Yaw: Axis 0
+  - Throttle: Axis 1 (inverted)
+  - Roll: Axis 3
+  - Pitch: Axis 4 (inverted)
+- Deadzone: `--joy-deadzone` (default 0.08).
 
-Always follow local regulations and no‑fly zones. Fly only in safe, legal environments.
 
----
+## How it works (short)
 
-## Roadmap
-- Add RTH and mission abort logic.
-- Improve GPS precision and landing accuracy (better GNSS module; RTK maybe).
-- Add vision‑based precision landing and obstacle avoidance.
-- 3D‑printed fairing to shield baro and protect electronics (optimize weight).
-- Web UI for mission selection over onboard Wi‑Fi AP.
+- The script reads altitude from Betaflight via MSP. On startup (or arm/takeoff), it saves a “zero” reference so all heights are relative to that point.
+- A PI controller adds/subtracts throttle around `--hover-pwm` to keep the drone at the target height.
+- GPS altitude (if available) can be blended in to improve robustness; a simple smoothing filter reduces noise.
+- A small state machine drives takeoff, hold, and land. Manual joystick input always wins and latches until you opt back into auto.
 
----
 
-## Somes pictures
-- ![PLACEHOLDER](https://i.ibb.co/bjTHBjmK/IMG-20250517-151836.jpg) Overall drone photo on bench (show frame, FC, Pi, GPS, payload hook).
-- ![PLACEHOLDER](https://i.ibb.co/pvfQtQ2Z/IMG-20250517-151832.jpg) Close‑up of FC rotated mounting with caption about 25.5×25.5 pattern.
-- ![PLACEHOLDER](https://i.ibb.co/hxq5JY8t/Capture-d-cran-2025-08-15-143926.png) Screenshot of demo mission CLI plan and in‑flight status.
-- ![PLACEHOLDER](https://i.ibb.co/xthchGw8/image.png) 3D printed shell concept render (from your CAD).
+## Tuning tips
 
----
+- Start with props off. Watch the UI line for altitude and throttle.
+- `--hover-pwm`: set near the PWM your quad needs to hover.
+- Increase `--kp` for faster response; add a little `--ki` to eliminate steady-state error. Use `--imax` to limit integral windup.
 
-## Credits
-- Firmware FC: Betaflight
-- Libraries: pyserial, pygame, gpiozero
-- Author: Octave Lory
+
+## Troubleshooting
+
+- No port found: pass `--port` explicitly, e.g., `--port COM7`.
+- No altitude: check barometer in Betaflight; GPS is optional.
+- Joystick not working: install `pygame` and verify Windows sees your controller.
+- Won’t arm: throttle must be at minimum; confirm ARM is mapped to AUX1 in Betaflight.
+
+
+## MSP details (for reference)
+
+- Reads: `MSP_ALTITUDE (109)`, `MSP_RAW_GPS (106)`
+- Writes: `MSP_SET_RAW_RC (200)`
+
+
+## Safety
+
+- Test with props off first.
+- Use in a safe environment at your own risk.
+- Always be ready to disarm.
