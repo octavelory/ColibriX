@@ -583,7 +583,7 @@ class JoystickInput:
     AXIS_ROLL = 3
     AXIS_PITCH = 4
     BUTTON_ARM_DISARM = 4
-    BUTTON_ALT_HOLD = 5
+    BUTTON_ALT_HOLD = 3
 
     def __init__(self, deadzone: float, logger: logging.Logger):
         self.deadzone = max(0.0, min(0.49, deadzone))
