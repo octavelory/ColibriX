@@ -298,7 +298,8 @@ class Autopilot:
         self.baro_alt0_cm: Optional[float] = None
         self.gps_alt0_cm: Optional[float] = None
         self.alt_filt_m: Optional[float] = None
-        self.manual_override: bool = False  # latched manual control via joystick
+        self.manual_override: bool = False  # latched full-manual control via joystick
+        self.altitude_assist: bool = False  # joystick-triggered altitude hold (autopilot controls throttle only)
         self.controller = PIController(params.kp, params.ki, params.imax)
         self.target_alt_m = params.target_alt
 
@@ -447,10 +448,10 @@ class Autopilot:
             self.set_bias("startup")
             self.bias_done = True
 
-        # Yaw lock and neutral attitude (skip neutralizing when manual override latched)
-        if self.params.yaw_lock:
+        # Yaw lock and neutral attitude (skip when joystick/manual or altitude assist)
+        if self.params.yaw_lock and not (self.manual_override or self.altitude_assist):
             self.rc[YAW_IDX] = RC_MID
-        if not self.manual_override:
+        if not (self.manual_override or self.altitude_assist):
             self.rc[ROLL_IDX] = RC_MID
             self.rc[PITCH_IDX] = RC_MID
 
@@ -465,7 +466,16 @@ class Autopilot:
                 # Conservative behavior: hold near hover PWM but do not ascend aggressively
                 self.rc[THROTTLE_IDX] = clamp(self.params.hover_pwm - 50, RC_MIN, RC_MAX)
             else:
-                if self.manual_override:
+                if self.altitude_assist:
+                    # Autopilot controls throttle to maintain target altitude; pilot controls R/P/Y
+                    error = (self.target_alt_m - alt_m)
+                    correction = self.controller.update(error, dt)
+                    commanded = self.params.hover_pwm + correction
+                    self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
+                    # Reflect state as HOLD for UI
+                    if self.state != Autopilot.HOLD:
+                        self.state = Autopilot.HOLD
+                elif self.manual_override:
                     # In manual override, reflect MANUAL state and keep joystick throttle
                     if self.state != Autopilot.MANUAL:
                         self.state = Autopilot.MANUAL
@@ -521,7 +531,7 @@ class Autopilot:
             alt_str = f"{alt:.2f}m" if alt is not None else "N/A"
             state_names = {0: "MANUAL", 1: "TAKEOFF", 2: "HOLD", 3: "LAND"}
             print(
-                f"State={state_names.get(self.state,'?'):<7} | Armed={'Y' if self.armed else 'N'} | Alt={alt_str:<6} | Target={self.target_alt_m:.2f}m | Thr={self.rc[THROTTLE_IDX]} | OVR={'Y' if self.manual_override else 'N'}",
+                f"State={state_names.get(self.state,'?'):<7} | Armed={'Y' if self.armed else 'N'} | Alt={alt_str:<6} | Target={self.target_alt_m:.2f}m | Thr={self.rc[THROTTLE_IDX]} | OVR={'Y' if self.manual_override else 'N'} | ALT_ASS={'Y' if self.altitude_assist else 'N'}",
                 end="\r",
                 flush=True,
             )
@@ -573,6 +583,7 @@ class JoystickInput:
     AXIS_ROLL = 3
     AXIS_PITCH = 4
     BUTTON_ARM_DISARM = 4
+    BUTTON_ALT_HOLD = 5
 
     def __init__(self, deadzone: float, logger: logging.Logger):
         self.deadzone = max(0.0, min(0.49, deadzone))
@@ -620,12 +631,31 @@ class JoystickInput:
         # Process events (buttons, etc.)
         for event in pygame.event.get():
             if event.type == pygame.JOYBUTTONDOWN:
-                ap.manual_override = True
+                # Any button press indicates pilot interaction
                 if event.button == self.BUTTON_ARM_DISARM:
+                    ap.manual_override = True
                     if ap.armed:
                         ap.disarm()
                     else:
                         ap.arm()
+                elif event.button == self.BUTTON_ALT_HOLD:
+                    if not ap.armed:
+                        self.log.warning("ALT-ASSIST request ignored: not armed")
+                    elif not ap._alt_valid():
+                        self.log.warning("ALT-ASSIST request ignored: no valid altitude")
+                    else:
+                        ap.manual_override = False
+                        ap.altitude_assist = not ap.altitude_assist
+                        if ap.altitude_assist:
+                            alt = ap._alt_m()
+                            if alt is not None:
+                                ap.target_alt_m = alt
+                            ap.state = Autopilot.HOLD
+                            ap.controller.reset()
+                            self.log.info("ALT-ASSIST ON (holding current altitude)")
+                        else:
+                            ap.manual_override = True  # fall back to manual throttle
+                            self.log.info("ALT-ASSIST OFF (manual)")
         # Read axes continuously
         try:
             yaw_v = self.joy.get_axis(self.AXIS_YAW)
@@ -634,17 +664,30 @@ class JoystickInput:
             pitch_v = self.joy.get_axis(self.AXIS_PITCH)
         except Exception:
             return
-        if any(abs(v) >= self.deadzone for v in (yaw_v, thr_v, roll_v, pitch_v)):
+        # Detect pilot stick activity
+        if any(abs(v) >= self.deadzone for v in (yaw_v, roll_v, pitch_v)):
             ap.manual_override = True
-        if ap.manual_override:
-            # Apply mappings
+
+        # Throttle stick: if in ALT-ASSIST and pilot moves throttle, exit assist and enter manual
+        if abs(thr_v) >= self.deadzone:
+            if ap.altitude_assist:
+                ap.altitude_assist = False
+                ap.manual_override = True
+                self.log.info("ALT-ASSIST cancelled by throttle movement -> MANUAL")
+            ap.manual_override = True
+
+        # Apply mappings
+        if ap.altitude_assist:
+            # Pilot controls attitude and yaw; autopilot keeps throttle
+            ap.rc[ROLL_IDX] = self._map_axis(roll_v)
+            ap.rc[PITCH_IDX] = self._map_axis(pitch_v, inverted=True)
+            ap.rc[YAW_IDX] = self._map_axis(yaw_v)
+        elif ap.manual_override:
+            # Full manual mapping including throttle
             ap.rc[THROTTLE_IDX] = self._map_axis(thr_v, inverted=True)
             ap.rc[ROLL_IDX] = self._map_axis(roll_v)
             ap.rc[PITCH_IDX] = self._map_axis(pitch_v, inverted=True)
-            if ap.params.yaw_lock:
-                ap.rc[YAW_IDX] = RC_MID
-            else:
-                ap.rc[YAW_IDX] = self._map_axis(yaw_v)
+            ap.rc[YAW_IDX] = self._map_axis(yaw_v)
 
 
 def build_logger(verbose: bool, quiet: bool) -> logging.Logger:
@@ -675,7 +718,7 @@ def parse_args() -> Params:
     p.add_argument("--imax", type=float, default=DEFAULT_IMAX, help="Integral clamp (abs PWM)")
     p.add_argument("--gps-weight", type=float, default=0.0, help="Weight of GPS altitude in fusion [0..1] (baro primary)")
     p.add_argument("--no-yaw-lock", action="store_true", help="Do not lock yaw to center")
-    p.add_argument("--joystick", action="store_true", help="Enable joystick manual override (pygame)")
+    p.add_argument("--joystick", action="store_true", default=True, help="Enable joystick manual override (pygame)")
     p.add_argument("--joy-deadzone", type=float, default=0.08, help="Joystick deadzone (0..0.49)")
     p.add_argument("--bias-on", type=str, choices=["startup", "arm", "takeoff", "never"], default="startup", help="When to zero altitude bias")
     p.add_argument("--alt-lpf", type=float, default=0.2, help="Altitude smoothing factor (alpha 0..1)")
