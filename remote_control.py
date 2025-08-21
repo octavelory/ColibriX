@@ -42,9 +42,9 @@ def show_cursor():
     print('\033[?25h', end='')
 
 # --- Configuration Globale ---
-ENABLE_THROTTLE_TEST_LIMIT = False # Mettre à False pour utiliser la pleine poussée (1000-2000)
+ENABLE_THROTTLE_TEST_LIMIT = True # Mettre à False pour utiliser la pleine poussée (1000-2000)
 THROTTLE_TEST_MIN_VALUE = 1000
-THROTTLE_TEST_MAX_VALUE = 1700
+THROTTLE_TEST_MAX_VALUE = 2100
 
 # --- Configuration et Constantes MSP ---
 # SERIAL_PORT n'est plus défini ici, il sera détecté automatiquement

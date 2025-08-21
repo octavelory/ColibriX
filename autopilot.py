@@ -102,7 +102,7 @@ DEFAULT_HOVER_PWM = 1550  # starting guess; adjust via --hover-pwm
 ALT_REQ_INTERVAL = 0.05   # seconds
 GPS_REQ_INTERVAL = 0.5    # seconds
 ATT_REQ_INTERVAL = 0.05   # seconds
-RC_SEND_INTERVAL = 0.01   # 100 Hz
+RC_SEND_INTERVAL = 0.005  # 200 Hz
 UI_PRINT_INTERVAL = 0.5
 SENSOR_TIMEOUT = 1.5      # seconds until altitude considered stale
 
@@ -368,6 +368,11 @@ class Autopilot:
         self.last_api_poll: float = 0.0
         self.last_telem_post: float = 0.0
         self.nav_active: bool = False
+        # API worker thread (to avoid blocking control loop on HTTP timeouts)
+        self.api_thread: Optional[threading.Thread] = None
+        self.api_stop_evt = threading.Event()
+        # Mark when RC values changed externally (e.g., joystick) to force immediate send
+        self.rc_dirty: bool = False
 
     # --- Utilities ---
     def _now(self) -> float:
@@ -492,6 +497,37 @@ class Autopilot:
         }
         self._http_post_json("/api/telemetry", payload)
 
+    # --- API background worker to avoid blocking the control loop ---
+    def _api_worker(self):
+        # Call existing throttled methods frequently; they self-rate-limit
+        while not self.api_stop_evt.is_set():
+            try:
+                self._poll_mission_api()
+                self._post_telemetry_api()
+            except Exception:
+                # Ignore API errors in worker loop
+                pass
+            time.sleep(0.05)
+
+    def start_api_thread(self):
+        if not self.params.api_url:
+            return
+        if self.api_thread is not None:
+            return
+        self.api_stop_evt.clear()
+        self.api_thread = threading.Thread(target=self._api_worker, daemon=True)
+        self.api_thread.start()
+
+    def stop_api_thread(self):
+        if self.api_thread is None:
+            return
+        self.api_stop_evt.set()
+        try:
+            self.api_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self.api_thread = None
+
     # --- Navigation helpers ---
     def _nav_conditions_met(self) -> bool:
         if not (self.params.api_url and self.msp):
@@ -552,6 +588,7 @@ class Autopilot:
             return
         self.rc[AUX1_IDX] = ARM_VALUE
         self.armed = True
+        self.rc_dirty = True
         if self.params.bias_on == "arm" and self._alt_valid():
             self.set_bias("arm")
         self.log.info("ARMED")
@@ -564,6 +601,7 @@ class Autopilot:
         self.armed = False
         self.state = Autopilot.MANUAL
         self.controller.reset()
+        self.rc_dirty = True
         self.log.info("DISARMED")
 
     def takeoff(self, target_alt_m: Optional[float] = None):
@@ -628,7 +666,8 @@ class Autopilot:
             self.msp.read_and_parse()
 
         # Web API polling and telemetry
-        if self.params.api_url:
+        # Run inline only if background worker not started
+        if self.params.api_url and (self.api_thread is None):
             self._poll_mission_api()
             self._post_telemetry_api()
 
@@ -731,10 +770,11 @@ class Autopilot:
             # Reflect NAV state for UI/telemetry
             self.state = Autopilot.NAV
 
-        # Send RC at fixed rate
-        if now - self.last_rc_send >= RC_SEND_INTERVAL:
+        # Send RC when changed or at fixed rate
+        if self.rc_dirty or (now - self.last_rc_send >= RC_SEND_INTERVAL):
             self._send_rc()
             self.last_rc_send = now
+            self.rc_dirty = False
 
         # Status UI
         if (not self.params.quiet) and (now - self.last_ui_print >= UI_PRINT_INTERVAL):
@@ -895,12 +935,14 @@ class JoystickInput:
             ap.rc[ROLL_IDX] = self._map_axis(roll_v)
             ap.rc[PITCH_IDX] = self._map_axis(pitch_v, inverted=True)
             ap.rc[YAW_IDX] = self._map_axis(yaw_v)
+            ap.rc_dirty = True
         elif ap.manual_override:
             # Full manual mapping including throttle
             ap.rc[THROTTLE_IDX] = self._map_axis(thr_v, inverted=True)
             ap.rc[ROLL_IDX] = self._map_axis(roll_v)
             ap.rc[PITCH_IDX] = self._map_axis(pitch_v, inverted=True)
             ap.rc[YAW_IDX] = self._map_axis(yaw_v)
+            ap.rc_dirty = True
 
 
 def build_logger(verbose: bool, quiet: bool) -> logging.Logger:
@@ -933,7 +975,7 @@ def parse_args() -> Params:
     p.add_argument("--no-yaw-lock", action="store_true", help="Do not lock yaw to center")
     p.add_argument("--joystick", action="store_true", default=True, help="Enable joystick manual override (pygame)")
     p.add_argument("--joy-deadzone", type=float, default=0.08, help="Joystick deadzone (0..0.49)")
-    p.add_argument("--bias-on", type=str, choices=["startup", "arm", "takeoff", "never"], default="startup", help="When to zero altitude bias")
+    p.add_argument("--bias-on", type=str, choices=["startup", "arm", "takeoff", "never"], default="never", help="When to zero altitude bias")
     p.add_argument("--alt-lpf", type=float, default=0.2, help="Altitude smoothing factor (alpha 0..1)")
     # Mission API + Navigation controls
     p.add_argument("--api-url", type=str, default=None, help="Web API base URL (e.g., http://localhost:5000)")
@@ -1037,18 +1079,23 @@ def main():
         js = JoystickInput(params.joy_deadzone, logger)
         js.start()
 
+    # Start API worker to avoid blocking the control loop
+    ap.start_api_thread()
+
     try:
         while not quit_evt.is_set():
             if js is not None:
                 js.poll(ap)
             ap.step()
-            time.sleep(0.005)
+            # Faster loop when in manual override for snappier response
+            time.sleep(0.002 if ap.manual_override else 0.005)
     except KeyboardInterrupt:
         pass
     finally:
         kh.stop()
         if js is not None:
             js.stop()
+        ap.stop_api_thread()
         # Try to shutdown safely
         try:
             ap.rc[THROTTLE_IDX] = RC_MIN
