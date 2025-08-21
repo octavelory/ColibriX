@@ -130,6 +130,7 @@ STATE_PERFORMING_FLIP = 4
 current_flight_state = STATE_MANUAL
 
 current_altitude_m = None
+alt_last_update_time = None
 last_msp_request_time = 0
 last_gps_request_time = 0
 MSP_REQUEST_INTERVAL = 0.05
@@ -160,6 +161,24 @@ joystick = None
 joystick_connected = False
 althold_active = False  # NOUVEAU: État du mode ALTHOLD
 
+# --- Contrôleur Maintien d'Altitude (Interne) ---
+ALT_HOVER_INITIAL = 1550
+ALT_KP = 40.0
+ALT_KI = 6.0
+ALT_KD = 25.0
+ALT_I_MAX = 120.0
+ALT_ADJUST_MAX = 200
+ALT_STICK_DEADBAND = 0.12
+ALT_SP_RATE_MPS = 1.5
+
+# États internes du maintien d'altitude
+last_throttle_axis = 0.0
+alt_hold_setpoint_m = None
+alt_hold_integral = 0.0
+alt_prev_alt_m = None
+alt_prev_time = None
+alt_hover_base_throttle = ALT_HOVER_INITIAL
+
 # --- Fonctions MSP (Inchangé) ---
 def calculate_checksum(payload):
     chk = 0
@@ -185,6 +204,7 @@ def request_msp_data(ser, command):
 
 def parse_msp_response(ser_buffer):
     global current_altitude_m, gps_fix, gps_num_sat, gps_latitude, gps_longitude, gps_altitude, gps_speed, gps_ground_course
+    global alt_last_update_time
     idx = ser_buffer.find(b'$M>')
     if idx == -1: return ser_buffer
     if len(ser_buffer) < idx + 5: return ser_buffer[idx:]
@@ -199,6 +219,7 @@ def parse_msp_response(ser_buffer):
         if cmd == MSP_ALTITUDE and payload_size >= 4:
             altitude_cm = struct.unpack('<i', payload_data[0:4])[0]
             current_altitude_m = float(altitude_cm) / 100.0
+            alt_last_update_time = time.time()
         elif cmd == MSP_RAW_GPS and payload_size >= 16:
             # Parse GPS data silently to avoid spam
             gps_fix = payload_data[0] != 0
@@ -212,6 +233,55 @@ def parse_msp_response(ser_buffer):
         return ser_buffer[idx+6+payload_size:]
     else:
         return ser_buffer[idx+1:]
+
+# --- Contrôleur de maintien d'altitude interne ---
+def run_alt_hold_controller(now):
+    global alt_prev_time, alt_prev_alt_m, alt_hold_integral, alt_hover_base_throttle
+    global current_rc_values, alt_hold_setpoint_m, last_throttle_axis
+    if current_altitude_m is None or alt_hold_setpoint_m is None:
+        return
+    # Calcul du dt
+    if alt_prev_time is None:
+        alt_prev_time = now
+        alt_prev_alt_m = current_altitude_m
+    dt = max(0.001, now - alt_prev_time)
+
+    # Ajustement du setpoint via le stick de throttle (trim en vitesse verticale)
+    axis = last_throttle_axis
+    if abs(axis) > ALT_STICK_DEADBAND:
+        norm = (abs(axis) - ALT_STICK_DEADBAND) / (1.0 - ALT_STICK_DEADBAND)
+        norm = max(0.0, min(1.0, norm))
+        # axe haut (valeur négative) -> augmenter le SP; axe bas (positif) -> diminuer
+        direction = -1.0 if axis > 0 else 1.0
+        sp_delta = direction * norm * ALT_SP_RATE_MPS * dt
+        alt_hold_setpoint_m = (alt_hold_setpoint_m or current_altitude_m) + sp_delta
+
+    # Mesure de taux de montée/descente
+    climb_rate = (current_altitude_m - (alt_prev_alt_m if alt_prev_alt_m is not None else current_altitude_m)) / dt
+    alt_prev_alt_m = current_altitude_m
+    alt_prev_time = now
+
+    # PID sur l'altitude (D sur la mesure)
+    error = (alt_hold_setpoint_m - current_altitude_m)
+    alt_hold_integral += error * dt
+    # Anti-windup
+    if alt_hold_integral > ALT_I_MAX: alt_hold_integral = ALT_I_MAX
+    if alt_hold_integral < -ALT_I_MAX: alt_hold_integral = -ALT_I_MAX
+
+    p_term = ALT_KP * error
+    i_term = ALT_KI * alt_hold_integral
+    d_term = -ALT_KD * climb_rate
+    adjust = p_term + i_term + d_term
+    # Limiter l'ajustement pour éviter les à-coups
+    if adjust > ALT_ADJUST_MAX: adjust = ALT_ADJUST_MAX
+    if adjust < -ALT_ADJUST_MAX: adjust = -ALT_ADJUST_MAX
+
+    # Suivi lent du throttle de base pour s'adapter au poids/batterie
+    alt_hover_base_throttle = int(0.995 * alt_hover_base_throttle + 0.005 * current_rc_values[2])
+
+    throttle_cmd = int(alt_hover_base_throttle + adjust)
+    throttle_cmd = max(THROTTLE_MIN_EFFECTIVE, min(THROTTLE_MAX_EFFECTIVE, throttle_cmd))
+    current_rc_values[2] = throttle_cmd
 
 # --- NOUVEAU: Initialisation Port Série ---
 def initialize_serial():
@@ -422,10 +492,10 @@ def print_status_display():
     arm_status = "🟢 ARMÉ" if is_armed_command else "🔴 DÉSARMÉ"
     arm_value = current_rc_values[4]
     
-    # Mode ALTHOLD
+    # Mode ALTHOLD (interne, sans AUX2)
     althold_color = Colors.GREEN if althold_active else Colors.GRAY
     althold_status = "🟢 ACTIF" if althold_active else "⚪ INACTIF"
-    althold_value = current_rc_values[5]
+    sp_str = f"{alt_hold_setpoint_m:.2f}m" if (althold_active and alt_hold_setpoint_m is not None) else "-"
     
     # Mode Servo Control
     servo_color = Colors.CYAN if servo_control_active else Colors.GRAY
@@ -434,10 +504,12 @@ def print_status_display():
     # Altitude
     alt_str = f"{current_altitude_m:.2f}m" if current_altitude_m is not None else "N/A"
     alt_color = Colors.GREEN if current_altitude_m is not None else Colors.RED
+    alt_dt_ms = None if alt_last_update_time is None else int((time.time() - alt_last_update_time) * 1000)
+    alt_dt_str = "N/A" if alt_dt_ms is None else f"{alt_dt_ms}ms"
     
     print(f"{Colors.BOLD}{Colors.BLUE}║{Colors.RESET} {Colors.BOLD}ARM:{Colors.RESET} {arm_color}{arm_status}{Colors.RESET} {Colors.GRAY}({arm_value}){Colors.RESET} │ " +
-          f"{Colors.BOLD}ALTHOLD:{Colors.RESET} {althold_color}{althold_status}{Colors.RESET} {Colors.GRAY}({althold_value}){Colors.RESET} │ " +
-          f"{Colors.BOLD}Altitude:{Colors.RESET} {alt_color}{alt_str}{Colors.RESET} {Colors.BOLD}{Colors.BLUE}║{Colors.RESET}")
+          f"{Colors.BOLD}ALTHOLD:{Colors.RESET} {althold_color}{althold_status}{Colors.RESET} {Colors.GRAY}(SP {sp_str}){Colors.RESET} │ " +
+          f"{Colors.BOLD}Altitude:{Colors.RESET} {alt_color}{alt_str}{Colors.RESET} {Colors.GRAY}(Δt {alt_dt_str}){Colors.RESET} {Colors.BOLD}{Colors.BLUE}║{Colors.RESET}")
     
     print(f"{Colors.BOLD}{Colors.BLUE}║{Colors.RESET} {Colors.BOLD}Contrôle:{Colors.RESET} {servo_color}{servo_status}{Colors.RESET}                                                      {Colors.BOLD}{Colors.BLUE}║{Colors.RESET}")
     
@@ -480,6 +552,7 @@ def handle_joystick_event(event):
     global current_rc_values, is_armed_command, joystick, joystick_connected, current_flight_state
     global flip_start_time, flip_phase, previous_flight_mode_rc_value
     global yaw_locked, althold_active, servo_control_active, target_servo1_pos, target_servo2_pos
+    global last_throttle_axis, alt_hold_setpoint_m, alt_hold_integral, alt_prev_time, alt_prev_alt_m, alt_hover_base_throttle
 
     if current_flight_state == STATE_MANUAL:
         if event.type == pygame.JOYAXISMOTION:
@@ -487,8 +560,14 @@ def handle_joystick_event(event):
                 if not yaw_locked and not servo_control_active:
                     current_rc_values[3] = map_axis_to_rc(event.value)
             elif event.axis == AXIS_THROTTLE:
-                # Le throttle fonctionne toujours, même en mode servo
-                current_rc_values[2] = map_axis_to_rc(event.value, THROTTLE_MIN_EFFECTIVE, THROTTLE_MAX_EFFECTIVE, inverted=True)
+                # Mémoriser la position brute du stick pour le trim de setpoint en ALTHOLD
+                last_throttle_axis = event.value
+                if althold_active and is_armed_command and current_altitude_m is not None:
+                    # En maintien d'altitude, le throttle n'est pas mappé directement
+                    pass
+                else:
+                    # En dehors de l'ALTHOLD, le throttle fonctionne normalement (même en mode servo)
+                    current_rc_values[2] = map_axis_to_rc(event.value, THROTTLE_MIN_EFFECTIVE, THROTTLE_MAX_EFFECTIVE, inverted=True)
             elif event.axis == AXIS_ROLL:
                 if servo_control_active:
                     # En mode servo, contrôler le servo1 avec l'axe ROLL (joystick droit X)
@@ -530,10 +609,18 @@ def handle_joystick_event(event):
                 print(f"{Colors.RED}{Colors.BOLD}🛑 DRONE DÉSARMÉ{Colors.RESET}")
         
         elif event.button == BUTTON_ALTHOLD:
+            # Activer maintien d'altitude interne (sans AUX2)
             althold_active = True
-            current_rc_values[5] = 1800
+            # Capturer setpoint et réinitialiser PID
+            alt_hold_setpoint_m = current_altitude_m if current_altitude_m is not None else None
+            alt_hold_integral = 0.0
+            alt_prev_time = None
+            alt_prev_alt_m = current_altitude_m
+            # Démarrer à partir du throttle courant pour éviter un saut
+            alt_hover_base_throttle = int(max(THROTTLE_MIN_EFFECTIVE, min(THROTTLE_MAX_EFFECTIVE, current_rc_values[2])))
             move_cursor(35, 1)
-            print(f"{Colors.GREEN}{Colors.BOLD}🔒 MODE ALTHOLD ACTIVÉ{Colors.RESET}")
+            sp_txt = f"SP={alt_hold_setpoint_m:.2f}m" if alt_hold_setpoint_m is not None else "SP=N/A"
+            print(f"{Colors.GREEN}{Colors.BOLD}🔒 MODE ALTHOLD ACTIVÉ{Colors.RESET}  {Colors.GRAY}{sp_txt}{Colors.RESET}")
 
         elif event.button == BUTTON_SERVO_CONTROL:
             servo_control_active = True
@@ -545,8 +632,12 @@ def handle_joystick_event(event):
 
     elif event.type == pygame.JOYBUTTONUP:
         if event.button == BUTTON_ALTHOLD:
+            # Désactiver maintien d'altitude interne
             althold_active = False
-            current_rc_values[5] = 1000
+            alt_hold_setpoint_m = None
+            alt_hold_integral = 0.0
+            # Reprendre immédiatement la main sur le throttle avec la dernière position de stick
+            current_rc_values[2] = map_axis_to_rc(last_throttle_axis, THROTTLE_MIN_EFFECTIVE, THROTTLE_MAX_EFFECTIVE, inverted=True)
             move_cursor(35, 1)
             print(f"{Colors.YELLOW}{Colors.BOLD}🔓 MODE ALTHOLD DÉSACTIVÉ{Colors.RESET}")
 
@@ -572,6 +663,7 @@ def main():
     global last_msp_request_time, last_gps_request_time, current_altitude_m
     global THROTTLE_MIN_EFFECTIVE, THROTTLE_MAX_EFFECTIVE, HOVER_THROTTLE_ESTIMATE, THROTTLE_SAFETY_ARM, TAKEOFF_THROTTLE_CEILING
     global yaw_locked, althold_active, servo_control_active, servos_initialized
+    global alt_hold_setpoint_m
 
     # --- Initialisation des valeurs dynamiques ---
     THROTTLE_MIN_EFFECTIVE = THROTTLE_TEST_MIN_VALUE if ENABLE_THROTTLE_TEST_LIMIT else 1000
@@ -667,6 +759,13 @@ def main():
                 # Gestion des modes de vol automatiques (si ils sont activés par d'autres moyens)
                 if is_armed_command and current_flight_state != STATE_MANUAL:
                     manage_auto_flight_modes()
+
+                # Maintien d'altitude interne (sans AUX2)
+                if althold_active and is_armed_command:
+                    # Initialiser le setpoint si lecture altitude arrive après activation
+                    if alt_hold_setpoint_m is None and current_altitude_m is not None:
+                        alt_hold_setpoint_m = current_altitude_m
+                    run_alt_hold_controller(current_time)
 
             # Sécurité Yaw Lock
             if yaw_locked:
