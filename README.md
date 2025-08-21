@@ -46,17 +46,25 @@ You don’t need to understand MSP or control theory to use it—just the keys a
   - If altitude is missing mid-flight, holds near-hover throttle conservatively.
   - Clamps throttle range. Disarms on exit.
 
+- Mission web API + waypoint navigation (optional)
+  - Polls a simple web API for mission state and destination (`/api/mission`).
+  - Posts telemetry (`/api/telemetry`).
+  - When mission state is `ACTIVE`, holds altitude and steers toward the destination using yaw + forward pitch until arrival.
+  - Arrival radius configurable; can auto-land and signal completion (`/api/mission/complete`).
+  - Web UI under `web/` to set destination, verify route, and launch mission.
+
 
 ## Requirements
 
 - Python 3.8+
 - pyserial (required)
 - pygame (optional, only for joystick override)
+ - Flask (optional, for the local mission web API/UI)
 
 Install:
 
 ```bash
-pip install pyserial pygame
+pip install pyserial pygame flask
 ```
 
 
@@ -87,6 +95,19 @@ python autopilot.py --target-alt 1.5 --hover-pwm 1550 -v
 ```bash
 python autopilot.py --joystick --joy-deadzone 0.08
 ```
+
+- With mission Web API + waypoint NAV (local server):
+
+```bash
+# Terminal 1: start the web API/UI
+python web/api_server.py
+
+# Terminal 2: run the autopilot connected to the API (dry-run example)
+python autopilot.py --dry-run --api-url http://127.0.0.1:5000 -v \
+  --nav-k-yaw 4.0 --nav-k-dist 5.0 --nav-pitch-max 250 --nav-arrival-m 8.0
+```
+
+Then open http://127.0.0.1:5000 in a browser, click on the map to set a destination (≤1 km), Verify, then Launch.
 
 - Useful options:
   - `--port COM5` or `/dev/ttyUSB0` to force a port.
@@ -145,7 +166,7 @@ Keyboard controls shown at startup:
 
 ## MSP details (for reference)
 
-- Reads: `MSP_ALTITUDE (109)`, `MSP_RAW_GPS (106)`
+- Reads: `MSP_ALTITUDE (109)`, `MSP_RAW_GPS (106)`, `MSP_ATTITUDE (108)`
 - Writes: `MSP_SET_RAW_RC (200)`
 
 

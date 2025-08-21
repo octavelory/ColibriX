@@ -37,6 +37,9 @@ import argparse
 import threading
 import platform
 from dataclasses import dataclass
+import json
+import math
+from urllib import request as urlrequest, error as urlerror
 
 from typing import Optional
 
@@ -72,6 +75,7 @@ BAUD_RATE = 115200
 MSP_SET_RAW_RC = 200
 MSP_ALTITUDE = 109
 MSP_RAW_GPS = 106
+MSP_ATTITUDE = 108
 
 # RC Channels (Betaflight order: Roll, Pitch, Throttle, Yaw, AUX1..)
 RC_CHANNELS_COUNT = 8
@@ -97,6 +101,7 @@ DEFAULT_TARGET_ALT = 1.5  # meters
 DEFAULT_HOVER_PWM = 1550  # starting guess; adjust via --hover-pwm
 ALT_REQ_INTERVAL = 0.05   # seconds
 GPS_REQ_INTERVAL = 0.5    # seconds
+ATT_REQ_INTERVAL = 0.05   # seconds
 RC_SEND_INTERVAL = 0.02   # 50 Hz
 UI_PRINT_INTERVAL = 0.5
 SENSOR_TIMEOUT = 1.5      # seconds until altitude considered stale
@@ -111,6 +116,37 @@ def calculate_checksum(payload: bytes) -> int:
 
 def clamp(val, vmin, vmax):
     return vmin if val < vmin else vmax if val > vmax else val
+
+
+def wrap180(deg: float) -> float:
+    # Wrap angle to [-180, 180)
+    while deg >= 180.0:
+        deg -= 360.0
+    while deg < -180.0:
+        deg += 360.0
+    return deg
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def initial_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    # Bearing from point 1 to point 2 in degrees [0..360)
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    brng = math.degrees(math.atan2(y, x))
+    if brng < 0:
+        brng += 360.0
+    return brng
 
 
 class MSPClient:
@@ -136,6 +172,11 @@ class MSPClient:
         self.gps_alt_cm: Optional[int] = None
         self.gps_speed_cms: Optional[int] = None
         self.gps_course_deg: Optional[float] = None
+        # Attitude (0.1 deg units from MSP)
+        self.att_roll_deg: Optional[float] = None
+        self.att_pitch_deg: Optional[float] = None
+        self.att_yaw_deg: Optional[float] = None
+        self.att_timestamp: float = 0.0
 
     def close(self):
         try:
@@ -227,6 +268,15 @@ class MSPClient:
             self.gps_alt_cm = struct.unpack("<h", payload[10:12])[0]
             self.gps_speed_cms = struct.unpack("<h", payload[12:14])[0]
             self.gps_course_deg = struct.unpack("<h", payload[14:16])[0] / 10.0
+        elif cmd == MSP_ATTITUDE and len(payload) >= 6:
+            # roll, pitch, yaw as int16 in 0.1 deg
+            r = struct.unpack("<h", payload[0:2])[0] / 10.0
+            p = struct.unpack("<h", payload[2:4])[0] / 10.0
+            y = struct.unpack("<h", payload[4:6])[0] / 10.0
+            self.att_roll_deg = r
+            self.att_pitch_deg = p
+            self.att_yaw_deg = y
+            self.att_timestamp = time.time()
 
 
 class PIController:
@@ -266,6 +316,12 @@ class Params:
     joy_deadzone: float
     bias_on: str
     alt_lpf: float
+    api_url: Optional[str]
+    nav_k_yaw: float
+    nav_k_dist: float
+    nav_pitch_max: int
+    nav_arrival_m: float
+    auto_land_on_arrival: bool
 
 
 class Autopilot:
@@ -273,6 +329,7 @@ class Autopilot:
     TAKEOFF = 1
     HOLD = 2
     LAND = 3
+    NAV = 4
 
     def __init__(self, msp: Optional[MSPClient], params: Params, logger: logging.Logger):
         self.msp = msp
@@ -283,6 +340,7 @@ class Autopilot:
         self.last_rc_send = 0.0
         self.last_alt_req = 0.0
         self.last_gps_req = 0.0
+        self.last_att_req = 0.0
         self.last_ui_print = 0.0
         self.last_time = time.time()
         self.bias_done = False
@@ -302,6 +360,14 @@ class Autopilot:
         self.altitude_assist: bool = False  # joystick-triggered altitude hold (autopilot controls throttle only)
         self.controller = PIController(params.kp, params.ki, params.imax)
         self.target_alt_m = params.target_alt
+        # Web API / Mission
+        self.mission_state: str = "IDLE"
+        self.dest_lat: Optional[float] = None
+        self.dest_lon: Optional[float] = None
+        self.dest_distance_m: Optional[float] = None
+        self.last_api_poll: float = 0.0
+        self.last_telem_post: float = 0.0
+        self.nav_active: bool = False
 
     # --- Utilities ---
     def _now(self) -> float:
@@ -361,6 +427,121 @@ class Autopilot:
             return
         payload = b"".join(struct.pack("<H", int(clamp(v, RC_MIN, RC_MAX))) for v in self.rc[:RC_CHANNELS_COUNT])
         self.msp.send_msp(MSP_SET_RAW_RC, payload)
+
+    # --- Mission API helpers ---
+    def _http_get_json(self, path: str) -> Optional[dict]:
+        if not self.params.api_url:
+            return None
+        url = self.params.api_url.rstrip("/") + path
+        try:
+            with urlrequest.urlopen(url, timeout=1.5) as resp:
+                if resp.status != 200:
+                    return None
+                data = resp.read()
+                return json.loads(data.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _http_post_json(self, path: str, payload: dict) -> bool:
+        if not self.params.api_url:
+            return False
+        url = self.params.api_url.rstrip("/") + path
+        try:
+            req = urlrequest.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+            with urlrequest.urlopen(req, timeout=1.5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def _poll_mission_api(self):
+        now = self._now()
+        if (now - self.last_api_poll) < 1.0:
+            return
+        self.last_api_poll = now
+        data = self._http_get_json("/api/mission")
+        if not data:
+            return
+        st = str(data.get("state") or "IDLE").upper()
+        self.mission_state = st
+        dest = data.get("destination") or {}
+        self.dest_lat = dest.get("lat") if isinstance(dest.get("lat"), (int, float)) else self.dest_lat
+        self.dest_lon = dest.get("lng") if isinstance(dest.get("lng"), (int, float)) else self.dest_lon
+
+    def _post_telemetry_api(self):
+        now = self._now()
+        if (now - self.last_telem_post) < 0.5:
+            return
+        self.last_telem_post = now
+        lat = self.msp.gps_lat if (self.msp and self.msp.gps_lat is not None) else None
+        lon = self.msp.gps_lon if (self.msp and self.msp.gps_lon is not None) else None
+        alt = self._alt_m()
+        hdg = None
+        if self.msp:
+            if self.msp.att_yaw_deg is not None:
+                hdg = self.msp.att_yaw_deg
+            elif self.msp.gps_course_deg is not None:
+                hdg = self.msp.gps_course_deg
+        payload = {
+            "lat": lat,
+            "lng": lon,
+            "altitude": alt,
+            "heading": hdg,
+            "mode": {0: "MANUAL", 1: "TAKEOFF", 2: "HOLD", 3: "LAND", 4: "NAV"}.get(self.state, "UNKNOWN"),
+            "armed": self.armed,
+            "gps": {"sats": self.msp.gps_num_sat if self.msp else None, "fix": int(self.msp.gps_fix) if self.msp else None},
+        }
+        self._http_post_json("/api/telemetry", payload)
+
+    # --- Navigation helpers ---
+    def _nav_conditions_met(self) -> bool:
+        if not (self.params.api_url and self.msp):
+            return False
+        if self.mission_state != "ACTIVE":
+            return False
+        if not self.armed:
+            return False
+        if self.manual_override:
+            return False
+        if not (self.msp.gps_fix and self.msp.gps_lat is not None and self.msp.gps_lon is not None):
+            return False
+        if self.dest_lat is None or self.dest_lon is None:
+            return False
+        # Need some heading source
+        if self.msp.att_yaw_deg is None and self.msp.gps_course_deg is None:
+            return False
+        return True
+
+    def _nav_step(self, dt: float):
+        # Compute distance/bearing
+        lat = self.msp.gps_lat
+        lon = self.msp.gps_lon
+        if lat is None or lon is None or self.dest_lat is None or self.dest_lon is None:
+            return
+        dist = haversine_m(lat, lon, self.dest_lat, self.dest_lon)
+        self.dest_distance_m = dist
+        # Arrival check
+        if dist <= max(0.5, self.params.nav_arrival_m):
+            self.nav_active = False
+            if self.params.auto_land_on_arrival:
+                self.land()
+            # Signal completion to API (best effort)
+            self._http_post_json("/api/mission/complete", {})
+            self.log.info("NAV: Arrived at destination")
+            return
+        brg = initial_bearing_deg(lat, lon, self.dest_lat, self.dest_lon)
+        # Heading source preference: attitude yaw, else GPS course
+        if self.msp.att_yaw_deg is not None:
+            hdg = self.msp.att_yaw_deg
+        else:
+            hdg = self.msp.gps_course_deg or 0.0
+        yaw_err = wrap180(brg - hdg)
+        yaw_offset = clamp(self.params.nav_k_yaw * yaw_err, -400.0, 400.0)
+        # Forward pitch based on distance
+        pitch_mag = clamp(self.params.nav_k_dist * min(dist, 50.0), 0.0, float(self.params.nav_pitch_max))
+        # Apply RC (pitch forward = below mid)
+        self.rc[YAW_IDX] = int(clamp(RC_MID + yaw_offset, RC_MIN, RC_MAX))
+        self.rc[ROLL_IDX] = RC_MID
+        self.rc[PITCH_IDX] = int(clamp(RC_MID - pitch_mag, RC_MIN, RC_MAX))
 
     # --- Public Controls ---
     def arm(self):
@@ -441,19 +622,44 @@ class Autopilot:
             if now - self.last_gps_req >= GPS_REQ_INTERVAL:
                 self.msp.request(MSP_RAW_GPS)
                 self.last_gps_req = now
+            if now - self.last_att_req >= ATT_REQ_INTERVAL:
+                self.msp.request(MSP_ATTITUDE)
+                self.last_att_req = now
             self.msp.read_and_parse()
+
+        # Web API polling and telemetry
+        if self.params.api_url:
+            self._poll_mission_api()
+            self._post_telemetry_api()
 
         # Smart bias at startup when data becomes valid
         if (not self.bias_done) and self.params.bias_on == "startup" and self._alt_valid():
             self.set_bias("startup")
             self.bias_done = True
 
-        # Yaw lock and neutral attitude (skip when joystick/manual or altitude assist)
-        if self.params.yaw_lock and not (self.manual_override or self.altitude_assist):
+        # Yaw lock and neutral attitude (skip when joystick/manual, altitude assist, or NAV)
+        if self.params.yaw_lock and not (self.manual_override or self.altitude_assist or self.nav_active):
             self.rc[YAW_IDX] = RC_MID
-        if not (self.manual_override or self.altitude_assist):
+        if not (self.manual_override or self.altitude_assist or self.nav_active):
             self.rc[ROLL_IDX] = RC_MID
             self.rc[PITCH_IDX] = RC_MID
+
+        # NAV activation / deactivation
+        should_nav = self._nav_conditions_met()
+        if should_nav and not self.nav_active:
+            self.nav_active = True
+            # Ensure altitude assist is ON to hold current altitude while navigating
+            if not self.altitude_assist and self._alt_valid():
+                alt = self._alt_m()
+                if alt is not None:
+                    self.target_alt_m = alt
+                self.controller.reset()
+                self.altitude_assist = True
+                self.state = Autopilot.HOLD
+                self.log.info("NAV: Enabled (ALT-ASSIST active)")
+        elif (not should_nav) and self.nav_active:
+            self.nav_active = False
+            self.log.info("NAV: Paused")
 
         # State machine
         if not self.armed:
@@ -473,7 +679,7 @@ class Autopilot:
                     commanded = self.params.hover_pwm + correction
                     self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
                     # Reflect state as HOLD for UI
-                    if self.state != Autopilot.HOLD:
+                    if self.state not in (Autopilot.HOLD, Autopilot.NAV):
                         self.state = Autopilot.HOLD
                 elif self.manual_override:
                     # In manual override, reflect MANUAL state and keep joystick throttle
@@ -520,6 +726,12 @@ class Autopilot:
                     if not self.manual_override:
                         self.rc[THROTTLE_IDX] = RC_MIN
 
+        # Mission NAV controller (lateral R/P/Y) runs after throttle logic
+        if self.nav_active:
+            self._nav_step(dt)
+            # Reflect NAV state for UI/telemetry
+            self.state = Autopilot.NAV
+
         # Send RC at fixed rate
         if now - self.last_rc_send >= RC_SEND_INTERVAL:
             self._send_rc()
@@ -529,9 +741,11 @@ class Autopilot:
         if (not self.params.quiet) and (now - self.last_ui_print >= UI_PRINT_INTERVAL):
             alt = self._alt_m()
             alt_str = f"{alt:.2f}m" if alt is not None else "N/A"
-            state_names = {0: "MANUAL", 1: "TAKEOFF", 2: "HOLD", 3: "LAND"}
+            state_names = {0: "MANUAL", 1: "TAKEOFF", 2: "HOLD", 3: "LAND", 4: "NAV"}
+            dist_str = f"{self.dest_distance_m:.1f}m" if (self.dest_distance_m is not None) else "--"
+            mis = self.mission_state if self.params.api_url else "N/A"
             print(
-                f"State={state_names.get(self.state,'?'):<7} | Armed={'Y' if self.armed else 'N'} | Alt={alt_str:<6} | Target={self.target_alt_m:.2f}m | Thr={self.rc[THROTTLE_IDX]} | OVR={'Y' if self.manual_override else 'N'} | ALT_ASS={'Y' if self.altitude_assist else 'N'}",
+                f"State={state_names.get(self.state,'?'):<7} | Armed={'Y' if self.armed else 'N'} | Alt={alt_str:<6} | Target={self.target_alt_m:.2f}m | Thr={self.rc[THROTTLE_IDX]} | OVR={'Y' if self.manual_override else 'N'} | ALT_ASS={'Y' if self.altitude_assist else 'N'} | MIS={mis:<9} | D={dist_str}",
                 end="\r",
                 flush=True,
             )
@@ -722,6 +936,13 @@ def parse_args() -> Params:
     p.add_argument("--joy-deadzone", type=float, default=0.08, help="Joystick deadzone (0..0.49)")
     p.add_argument("--bias-on", type=str, choices=["startup", "arm", "takeoff", "never"], default="startup", help="When to zero altitude bias")
     p.add_argument("--alt-lpf", type=float, default=0.2, help="Altitude smoothing factor (alpha 0..1)")
+    # Mission API + Navigation controls
+    p.add_argument("--api-url", type=str, default=None, help="Web API base URL (e.g., http://localhost:5000)")
+    p.add_argument("--nav-k-yaw", type=float, default=4.0, help="Yaw RC units per degree of bearing error")
+    p.add_argument("--nav-k-dist", type=float, default=5.0, help="Pitch RC units per meter of distance (capped by --nav-pitch-max)")
+    p.add_argument("--nav-pitch-max", type=int, default=250, help="Max forward pitch deflection (RC units below mid)")
+    p.add_argument("--nav-arrival-m", type=float, default=8.0, help="Arrival radius (meters)")
+    p.add_argument("--auto-land-on-arrival", action="store_true", help="Automatically initiate landing when inside arrival radius")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose logs")
     p.add_argument("-q", "--quiet", action="store_true", help="Quiet logs (warnings only)")
     p.add_argument("--dry-run", action="store_true", help="Run without serial (no RC output)")
@@ -744,6 +965,12 @@ def parse_args() -> Params:
         joy_deadzone=args.joy_deadzone,
         bias_on=args.bias_on,
         alt_lpf=args.alt_lpf,
+        api_url=args.api_url,
+        nav_k_yaw=args.nav_k_yaw,
+        nav_k_dist=args.nav_k_dist,
+        nav_pitch_max=int(clamp(args.nav_pitch_max, 0, 500)),
+        nav_arrival_m=max(0.5, args.nav_arrival_m),
+        auto_land_on_arrival=bool(args.auto_land_on_arrival),
     )
 
 
