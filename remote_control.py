@@ -626,6 +626,13 @@ def main():
         pygame.quit()
         sys.exit(1) # Quitter si aucun port série n'est trouvé
 
+    # Nettoyer les buffers pour éviter un décalage initial dû à des données en attente
+    try:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+    except Exception:
+        pass
+
     ser_buffer = b''
     running = True
     try:
@@ -648,7 +655,12 @@ def main():
             
             if ser.in_waiting > 0:
                 ser_buffer += ser.read(ser.in_waiting)
-            ser_buffer = parse_msp_response(ser_buffer)
+            # Traiter toutes les trames MSP complètes présentes afin d'éviter l'accumulation et le retard
+            while True:
+                new_buffer = parse_msp_response(ser_buffer)
+                if len(new_buffer) == len(ser_buffer):
+                    break  # Aucun paquet complet supplémentaire à traiter
+                ser_buffer = new_buffer
 
             # 3. Application de la logique de contrôle (Mode auto supprimé)
             if joystick_connected:
