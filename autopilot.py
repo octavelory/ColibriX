@@ -102,7 +102,7 @@ DEFAULT_HOVER_PWM = 1550  # starting guess; adjust via --hover-pwm
 ALT_REQ_INTERVAL = 0.05   # seconds
 GPS_REQ_INTERVAL = 0.5    # seconds
 ATT_REQ_INTERVAL = 0.05   # seconds
-RC_SEND_INTERVAL = 0.02   # 50 Hz
+RC_SEND_INTERVAL = 0.01   # 100 Hz
 UI_PRINT_INTERVAL = 0.5
 SENSOR_TIMEOUT = 1.5      # seconds until altitude considered stale
 
@@ -666,64 +666,63 @@ class Autopilot:
             self.state = Autopilot.MANUAL
             self.rc[THROTTLE_IDX] = RC_MIN
         else:
-            alt_m = self._alt_m()
-            # Handle missing altitude mid-flight
-            if alt_m is None:
-                # Conservative behavior: hold near hover PWM but do not ascend aggressively
-                self.rc[THROTTLE_IDX] = clamp(self.params.hover_pwm - 50, RC_MIN, RC_MAX)
+            # If the pilot is in manual override, never touch throttle here
+            if self.manual_override:
+                if self.state != Autopilot.MANUAL:
+                    self.state = Autopilot.MANUAL
+                    self.controller.reset()
+                # Do not modify RC here; joystick has authority
             else:
-                if self.altitude_assist:
-                    # Autopilot controls throttle to maintain target altitude; pilot controls R/P/Y
-                    error = (self.target_alt_m - alt_m)
-                    correction = self.controller.update(error, dt)
-                    commanded = self.params.hover_pwm + correction
-                    self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
-                    # Reflect state as HOLD for UI
-                    if self.state not in (Autopilot.HOLD, Autopilot.NAV):
-                        self.state = Autopilot.HOLD
-                elif self.manual_override:
-                    # In manual override, reflect MANUAL state and keep joystick throttle
-                    if self.state != Autopilot.MANUAL:
-                        self.state = Autopilot.MANUAL
-                        self.controller.reset()
-                    # Do not modify RC here; joystick already set throttle/attitude
-                    pass
-                elif self.state == Autopilot.TAKEOFF:
-                    # PI control towards target; allow slight extra ceiling during takeoff
-                    error = (self.target_alt_m - alt_m)
-                    correction = self.controller.update(error, dt)
-                    commanded = self.params.hover_pwm + correction
-                    # Allow a modest ceiling to ensure liftoff
-                    commanded = clamp(commanded, RC_MIN, min(RC_MAX, self.params.hover_pwm + 200))
-                    self.rc[THROTTLE_IDX] = int(commanded)
-                    if error <= 0.15:
-                        # Reached target -> HOLD
-                        self.state = Autopilot.HOLD
-                        self.controller.reset()
-                        self.log.info("Reached target; HOLD")
-                elif self.state == Autopilot.HOLD:
-                    error = (self.target_alt_m - alt_m)
-                    correction = self.controller.update(error, dt)
-                    commanded = self.params.hover_pwm + correction
-                    self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
-                elif self.state == Autopilot.LAND:
-                    # Target is 0 m; reduce throttle with gentle descent
-                    landing_target = 0.0
-                    error = (landing_target - alt_m)
-                    correction = self.controller.update(error, dt) * 0.5  # softer integral during land
-                    base = self.params.hover_pwm - 80  # slight below-hover bias
-                    commanded = base + correction
-                    # As we get very low, reduce further
-                    if alt_m < 0.25:
-                        commanded = min(commanded, RC_MIN + 50)
-                    self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
-                    if alt_m < 0.12:
-                        # Cut and disarm when very close to ground
-                        self.rc[THROTTLE_IDX] = RC_MIN
-                        self.disarm()
+                alt_m = self._alt_m()
+                # Handle missing altitude mid-flight
+                if alt_m is None:
+                    # Conservative behavior: hold near hover PWM but do not ascend aggressively
+                    self.rc[THROTTLE_IDX] = clamp(self.params.hover_pwm - 50, RC_MIN, RC_MAX)
                 else:
-                    # MANUAL (but we still keep neutral attitude)
-                    if not self.manual_override:
+                    if self.altitude_assist:
+                        # Autopilot controls throttle to maintain target altitude; pilot controls R/P/Y
+                        error = (self.target_alt_m - alt_m)
+                        correction = self.controller.update(error, dt)
+                        commanded = self.params.hover_pwm + correction
+                        self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
+                        # Reflect state as HOLD for UI
+                        if self.state not in (Autopilot.HOLD, Autopilot.NAV):
+                            self.state = Autopilot.HOLD
+                    elif self.state == Autopilot.TAKEOFF:
+                        # PI control towards target; allow slight extra ceiling during takeoff
+                        error = (self.target_alt_m - alt_m)
+                        correction = self.controller.update(error, dt)
+                        commanded = self.params.hover_pwm + correction
+                        # Allow a modest ceiling to ensure liftoff
+                        commanded = clamp(commanded, RC_MIN, min(RC_MAX, self.params.hover_pwm + 200))
+                        self.rc[THROTTLE_IDX] = int(commanded)
+                        if error <= 0.15:
+                            # Reached target -> HOLD
+                            self.state = Autopilot.HOLD
+                            self.controller.reset()
+                            self.log.info("Reached target; HOLD")
+                    elif self.state == Autopilot.HOLD:
+                        error = (self.target_alt_m - alt_m)
+                        correction = self.controller.update(error, dt)
+                        commanded = self.params.hover_pwm + correction
+                        self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
+                    elif self.state == Autopilot.LAND:
+                        # Target is 0 m; reduce throttle with gentle descent
+                        landing_target = 0.0
+                        error = (landing_target - alt_m)
+                        correction = self.controller.update(error, dt) * 0.5  # softer integral during land
+                        base = self.params.hover_pwm - 80  # slight below-hover bias
+                        commanded = base + correction
+                        # As we get very low, reduce further
+                        if alt_m < 0.25:
+                            commanded = min(commanded, RC_MIN + 50)
+                        self.rc[THROTTLE_IDX] = int(clamp(commanded, RC_MIN, RC_MAX))
+                        if alt_m < 0.12:
+                            # Cut and disarm when very close to ground
+                            self.rc[THROTTLE_IDX] = RC_MIN
+                            self.disarm()
+                    else:
+                        # MANUAL with no joystick override: keep throttle low
                         self.rc[THROTTLE_IDX] = RC_MIN
 
         # Mission NAV controller (lateral R/P/Y) runs after throttle logic
