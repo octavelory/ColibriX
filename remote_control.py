@@ -6,6 +6,10 @@ import sys
 import os
 import pygame
 from gpiozero import Servo
+import json
+import threading
+import urllib.request
+import urllib.error
 
 # --- COULEURS ET INTERFACE ---
 class Colors:
@@ -658,6 +662,86 @@ def handle_joystick_event(event):
 def print_status():
     print_status_display()
 
+# --- Telemetry Publisher (HTTP POST -> API server) ---
+class TelemetryPublisher:
+    """Publie la télémétrie vers l'API pour diffusion SSE en temps réel.
+    Utilise urllib (sans dépendances externes)."""
+    def __init__(self, url=None, rate_hz=15):
+        self.url = url or os.environ.get('COLIBRIX_API_URL', 'http://127.0.0.1:5000/api/telemetry')
+        try:
+            rate = float(rate_hz)
+            self.period = max(0.02, 1.0 / rate)
+        except Exception:
+            self.period = 0.066
+        self._stop = False
+        self._thr = None
+        self._last_sent = 0.0
+        self._last_payload = None
+
+    def start(self):
+        if self._thr is None:
+            self._thr = threading.Thread(target=self._run, daemon=True)
+            self._thr.start()
+
+    def stop(self):
+        self._stop = True
+        if self._thr is not None:
+            try:
+                self._thr.join(timeout=1.0)
+            except Exception:
+                pass
+
+    def _make_payload(self):
+        # Accès lecture aux globals (sans lock, valeurs instantanées suffisent)
+        payload = {}
+        # Position
+        if gps_latitude != 0 or gps_longitude != 0:
+            payload['lat'] = gps_latitude
+            payload['lng'] = gps_longitude
+        # Altitude
+        if current_altitude_m is not None:
+            try:
+                payload['altitude'] = float(current_altitude_m)
+            except Exception:
+                pass
+        # Cap approximé via course sol GPS si dispo
+        try:
+            if gps_ground_course is not None:
+                payload['heading'] = float(gps_ground_course)
+        except Exception:
+            pass
+        # État
+        payload['armed'] = bool(is_armed_command)
+        try:
+            state_names = ["MANUAL", "AUTO_TAKEOFF", "AUTO_HOVER", "AUTO_LANDING", "FLIP"]
+            payload['mode'] = state_names[current_flight_state] if 0 <= current_flight_state < len(state_names) else "UNKNOWN"
+        except Exception:
+            payload['mode'] = "UNKNOWN"
+        # GPS bruts
+        payload['gps'] = { 'sats': gps_num_sat, 'fix': 1 if gps_fix else 0 }
+        return payload
+
+    def _send(self, data_dict):
+        try:
+            data = json.dumps(data_dict).encode('utf-8')
+            req = urllib.request.Request(self.url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
+            with urllib.request.urlopen(req, timeout=0.3) as resp:
+                # Pas besoin de lire la réponse
+                _ = resp.read(0)
+        except Exception:
+            # Silencieux pour ne pas polluer la boucle de contrôle
+            pass
+
+    def _run(self):
+        while not self._stop:
+            now = time.time()
+            payload = self._make_payload()
+            if payload != self._last_payload or (now - self._last_sent) > 1.0:
+                self._send(payload)
+                self._last_payload = payload
+                self._last_sent = now
+            time.sleep(self.period)
+
 def main():
     global current_rc_values, is_armed_command, joystick, joystick_connected, current_flight_state
     global last_msp_request_time, last_gps_request_time, current_altitude_m
@@ -727,7 +811,11 @@ def main():
 
     ser_buffer = b''
     running = True
+    telemetry_publisher = None
     try:
+        # Démarrer la publication télémétrie temps réel (SSE via API)
+        telemetry_publisher = TelemetryPublisher(rate_hz=15)
+        telemetry_publisher.start()
         while running:
             # 1. Gestion des événements manette
             for event in pygame.event.get():
@@ -814,6 +902,12 @@ def main():
         move_cursor(35, 1)
         print(f"\n{Colors.RED}Erreur: {e}{Colors.RESET}")
     finally:
+        # Arrêt propre du publisher télémétrie
+        try:
+            if telemetry_publisher is not None:
+                telemetry_publisher.stop()
+        except Exception:
+            pass
         show_cursor()
         print(f"\n{Colors.CYAN}Nettoyage et arrêt sécurisé...{Colors.RESET}")
         
