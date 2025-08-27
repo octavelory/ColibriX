@@ -57,6 +57,7 @@ MSP_SET_RAW_RC = 200
 MSP_ALTITUDE = 109
 MSP_RAW_GPS = 106
 MSP_COMP_GPS = 107
+MSP_ANALOG = 110
 
 # --- Configuration du Contrôle ---
 RC_CHANNELS_COUNT = 8
@@ -84,6 +85,9 @@ gps_longitude = 0
 gps_altitude = 0
 gps_speed = 0
 gps_ground_course = 0
+
+# --- Batterie ---
+battery_voltage_v = None  # Tension pack (V), lue via MSP_ANALOG si dispo
 
 # --- Configuration Verrouillage Yaw ---
 yaw_locked = False # Yaw verrouillé par défaut au démarrage
@@ -139,6 +143,8 @@ last_msp_request_time = 0
 last_gps_request_time = 0
 MSP_REQUEST_INTERVAL = 0.05
 GPS_REQUEST_INTERVAL = 0.5  # Requête GPS moins fréquente
+last_analog_request_time = 0
+ANALOG_REQUEST_INTERVAL = 1.0  # Requête VBAT ~1 Hz
 
 HOVER_THROTTLE_ESTIMATE = (THROTTLE_MIN_EFFECTIVE + THROTTLE_MAX_EFFECTIVE) // 2 + 50
 KP_ALTITUDE = 20.0
@@ -234,6 +240,31 @@ def parse_msp_response(ser_buffer):
                 gps_altitude = struct.unpack('<h', payload_data[10:12])[0]
                 gps_speed = struct.unpack('<h', payload_data[12:14])[0]
                 gps_ground_course = struct.unpack('<h', payload_data[14:16])[0] / 10.0
+        elif cmd == MSP_ANALOG:
+            # Essayer de déduire la tension batterie de manière robuste (différentes variantes MSP)
+            # On tente plusieurs interprétations plausibles et on garde une valeur réaliste (6V-25V)
+            v_candidate = None
+            try:
+                if payload_size >= 2:
+                    raw = struct.unpack('<H', payload_data[0:2])[0]
+                    # Essai 1: millivolts
+                    mv = raw
+                    if 6000 <= mv <= 25000:
+                        v_candidate = mv / 1000.0
+                    else:
+                        # Essai 2: dixièmes de volt
+                        tenth = raw / 10.0
+                        if 6.0 <= tenth <= 25.0:
+                            v_candidate = tenth
+                if v_candidate is None and payload_size >= 1:
+                    b = payload_data[0]
+                    # Essai 3: 0.1V sur 1 octet
+                    if 60 <= b <= 250:
+                        v_candidate = b / 10.0
+            except Exception:
+                v_candidate = None
+            if v_candidate is not None:
+                globals()['battery_voltage_v'] = float(v_candidate)
         return ser_buffer[idx+6+payload_size:]
     else:
         return ser_buffer[idx+1:]
@@ -704,6 +735,12 @@ class TelemetryPublisher:
                 payload['altitude'] = float(current_altitude_m)
             except Exception:
                 pass
+        # Tension batterie (le serveur API calculera le % 3S si besoin)
+        try:
+            if battery_voltage_v is not None:
+                payload['voltage'] = float(battery_voltage_v)
+        except Exception:
+            pass
         # Cap approximé via course sol GPS si dispo
         try:
             if gps_ground_course is not None:
@@ -720,6 +757,19 @@ class TelemetryPublisher:
         # GPS bruts
         payload['gps'] = { 'sats': gps_num_sat, 'fix': 1 if gps_fix else 0 }
         return payload
+
+# --- Démarrage du serveur API Flask intégré ---
+def start_api_server_background():
+    def _run():
+        try:
+            from api_server import app
+            print("Démarrage du serveur API Flask en arrière-plan sur 0.0.0.0:5000 ...")
+            app.run(host='0.0.0.0', port=5000, threaded=True, debug=False, use_reloader=False)
+        except Exception as e:
+            print(f"Erreur serveur API: {e}")
+    thr = threading.Thread(target=_run, daemon=True)
+    thr.start()
+    return thr
 
     def _send(self, data_dict):
         try:
@@ -744,7 +794,7 @@ class TelemetryPublisher:
 
 def main():
     global current_rc_values, is_armed_command, joystick, joystick_connected, current_flight_state
-    global last_msp_request_time, last_gps_request_time, current_altitude_m
+    global last_msp_request_time, last_gps_request_time, last_analog_request_time, current_altitude_m
     global THROTTLE_MIN_EFFECTIVE, THROTTLE_MAX_EFFECTIVE, HOVER_THROTTLE_ESTIMATE, THROTTLE_SAFETY_ARM, TAKEOFF_THROTTLE_CEILING
     global yaw_locked, althold_active, servo_control_active, servos_initialized
     global alt_hold_setpoint_m
@@ -791,6 +841,12 @@ def main():
     print_banner()
     hide_cursor()
 
+    # --- Démarrage du serveur API Flask intégré ---
+    try:
+        start_api_server_background()
+    except Exception as e:
+        print(f"Impossible de démarrer l'API intégrée: {e}")
+
     # --- Initialisation des Servos ---
     servos_initialized = initialize_servos()
     if not servos_initialized:
@@ -832,6 +888,10 @@ def main():
             if current_time - last_gps_request_time > GPS_REQUEST_INTERVAL:
                 request_msp_data(ser, MSP_RAW_GPS)
                 last_gps_request_time = current_time
+
+            if current_time - last_analog_request_time > ANALOG_REQUEST_INTERVAL:
+                request_msp_data(ser, MSP_ANALOG)
+                last_analog_request_time = current_time
             
             if ser.in_waiting > 0:
                 ser_buffer += ser.read(ser.in_waiting)

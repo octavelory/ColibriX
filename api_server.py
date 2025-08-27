@@ -32,6 +32,7 @@ state = {
         "lng": 2.3522,
         "altitude": 120.0,
         "battery": 92.0,
+        "voltage": None,
         "heading": 0.0,
         "mode": "STANDBY",
         "armed": False,
@@ -68,6 +69,45 @@ def as_float(v):
         return float(v) if v is not None else None
     except (ValueError, TypeError):
         return None
+
+def estimate_battery_pct_from_voltage(voltage_v, cells=3):
+    """Estimate LiPo percentage from pack voltage for a 3S by default.
+    Uses a simple piecewise-linear curve per cell (OCV under light load).
+    Returns a float in [0, 100]."""
+    try:
+        if voltage_v is None or cells is None or cells <= 0:
+            return None
+        per_cell = float(voltage_v) / float(cells)
+        # (Voltage per cell, Percent)
+        points = [
+            (3.30, 0.0),
+            (3.50, 10.0),
+            (3.61, 20.0),
+            (3.67, 30.0),
+            (3.73, 40.0),
+            (3.80, 50.0),
+            (3.87, 60.0),
+            (3.95, 70.0),
+            (4.00, 80.0),
+            (4.10, 90.0),
+            (4.20, 100.0),
+        ]
+        if per_cell <= points[0][0]:
+            return 0.0
+        if per_cell >= points[-1][0]:
+            return 100.0
+        for i in range(1, len(points)):
+            v0, p0 = points[i-1]
+            v1, p1 = points[i]
+            if per_cell <= v1:
+                t = (per_cell - v0) / (v1 - v0)
+                pct = p0 + t * (p1 - p0)
+                if pct < 0.0: pct = 0.0
+                if pct > 100.0: pct = 100.0
+                return pct
+    except Exception:
+        return None
+    return None
 
 # Static file serving
 @app.get('/')
@@ -120,6 +160,7 @@ def ingest_telemetry():
     alt = pick(data, ['alt', 'altitude', 'relative_alt'])
     heading = pick(data, ['heading', 'yaw'])
     battery = pick(data, ['battery', 'battery_pct', 'battery_percent', 'batteryPercent'])
+    voltage = pick(data, ['voltage', 'vbatt', 'vbat', 'battery_voltage'])
     mode = pick(data, ['mode', 'flight_mode', 'apmode'])
     armed = pick(data, ['armed', 'is_armed'])
 
@@ -131,6 +172,7 @@ def ingest_telemetry():
     alt_f = as_float(alt)
     hdg_f = as_float(heading)
     bat_f = as_float(battery)
+    v_f = as_float(voltage)
 
     if lat_f is not None:
         d['lat'] = lat_f
@@ -140,8 +182,14 @@ def ingest_telemetry():
         d['altitude'] = alt_f
     if hdg_f is not None:
         d['heading'] = hdg_f
+    if v_f is not None:
+        d['voltage'] = v_f
     if bat_f is not None:
         d['battery'] = bat_f
+    elif v_f is not None:
+        est = estimate_battery_pct_from_voltage(v_f, cells=3)
+        if est is not None:
+            d['battery'] = est
     if mode is not None:
         d['mode'] = str(mode)
     if armed is not None:

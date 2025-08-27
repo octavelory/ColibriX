@@ -61,7 +61,7 @@ function updateHudClock() {
 function updateStatusPanel() {
   document.getElementById('stat-lat').textContent = AppState.drone.lat.toFixed(5);
   document.getElementById('stat-lng').textContent = AppState.drone.lng.toFixed(5);
-  document.getElementById('stat-alt').textContent = AppState.drone.altitude.toFixed(0) + ' m';
+  document.getElementById('stat-alt').textContent = AppState.drone.altitude.toFixed(2) + ' m';
   document.getElementById('stat-bat').textContent = AppState.drone.battery.toFixed(0) + '%';
   const missionState = document.getElementById('mission-state');
   missionState.textContent = translateMissionState(AppState.mission.state);
@@ -336,6 +336,8 @@ function bindUI() {
   document.getElementById('btn-verify').addEventListener('click', verifyRoute);
   document.getElementById('btn-launch').addEventListener('click', launchMission);
   document.getElementById('btn-reset').addEventListener('click', resetMission);
+  const recenterBtn = document.getElementById('recenter');
+  if (recenterBtn) recenterBtn.addEventListener('click', recenterMap);
   const toggleLog = document.getElementById('toggle-log');
   toggleLog.addEventListener('click', () => {
     const stream = document.getElementById('log-stream');
@@ -355,6 +357,12 @@ function smoothZoom(direction) {
   const target = map.getZoom() + direction;
   if (target < 3 || target > 19) return;
   map.setZoom(target, { animate:true });
+}
+
+function recenterMap() {
+  const { lat, lng } = AppState.drone;
+  if (typeof lat !== 'number' || typeof lng !== 'number') return;
+  AppState.map.panTo([lat, lng], { animate: true });
 }
 
 function initCustomStyles() {
