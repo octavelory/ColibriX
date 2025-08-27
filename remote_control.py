@@ -758,19 +758,6 @@ class TelemetryPublisher:
         payload['gps'] = { 'sats': gps_num_sat, 'fix': 1 if gps_fix else 0 }
         return payload
 
-# --- Démarrage du serveur API Flask intégré ---
-def start_api_server_background():
-    def _run():
-        try:
-            from api_server import app
-            print("Démarrage du serveur API Flask en arrière-plan sur 0.0.0.0:5000 ...")
-            app.run(host='0.0.0.0', port=5000, threaded=True, debug=False, use_reloader=False)
-        except Exception as e:
-            print(f"Erreur serveur API: {e}")
-    thr = threading.Thread(target=_run, daemon=True)
-    thr.start()
-    return thr
-
     def _send(self, data_dict):
         try:
             data = json.dumps(data_dict).encode('utf-8')
@@ -791,6 +778,19 @@ def start_api_server_background():
                 self._last_payload = payload
                 self._last_sent = now
             time.sleep(self.period)
+
+# --- Démarrage du serveur API Flask intégré ---
+def start_api_server_background():
+    def _run():
+        try:
+            from api_server import app
+            print("Démarrage du serveur API Flask en arrière-plan sur 0.0.0.0:5000 ...")
+            app.run(host='0.0.0.0', port=5000, threaded=True, debug=False, use_reloader=False)
+        except Exception as e:
+            print(f"Erreur serveur API: {e}")
+    thr = threading.Thread(target=_run, daemon=True)
+    thr.start()
+    return thr
 
 def main():
     global current_rc_values, is_armed_command, joystick, joystick_connected, current_flight_state
