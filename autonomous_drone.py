@@ -8,6 +8,8 @@ import threading
 import time
 import os
 import json
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -703,6 +705,32 @@ class MspClient:
             except Exception:
                 pass
             time.sleep(0.005)
+
+    def stop(self):
+        """Stop background MSP thread and close serial port."""
+        try:
+            self._stop_evt.set()
+            if self._thread is not None:
+                try:
+                    self._thread.join(timeout=1.0)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if self.ser is not None:
+                    try:
+                        # send a final neutral/disarm frame for safety
+                        payload = b''.join(struct.pack('<H', PWM_MIN if i in (2, AUX_ARM_CH) else PWM_MID) for i in range(RC_CHANNELS_COUNT))
+                        self._send_msp(MSP_SET_RAW_RC, payload)
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
+                    try:
+                        self.ser.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     # ----- RC -----
     def send_rc(self, rc_values: List[int]):
@@ -1440,6 +1468,137 @@ class Autopilot:
 
 
 # ------------------------
+# Web API integration (same pattern as remote_control.py)
+# ------------------------
+
+class TelemetryPublisher:
+    """Publishes telemetry to the local API server for SSE streaming to the UI.
+
+    Uses urllib only (no extra deps). Thread-safe snapshots are taken from
+    MspClient.state and Autopilot where helpful.
+    """
+    def __init__(self, msp: 'MspClient', ap: Optional['Autopilot'] = None,
+                 url: Optional[str] = None, rate_hz: float = 15.0):
+        self.msp = msp
+        self.ap = ap
+        self.url = url or os.environ.get('COLIBRIX_API_URL', 'http://127.0.0.1:5000/api/telemetry')
+        try:
+            self.period = max(0.02, 1.0 / float(rate_hz))
+        except Exception:
+            self.period = 0.066
+        self._stop = False
+        self._thr: Optional[threading.Thread] = None
+        self._last_sent = 0.0
+        self._last_payload = None
+
+    def start(self):
+        if self._thr is None:
+            self._thr = threading.Thread(target=self._run, daemon=True)
+            self._thr.start()
+
+    def stop(self):
+        self._stop = True
+        if self._thr is not None:
+            try:
+                self._thr.join(timeout=1.0)
+            except Exception:
+                pass
+
+    def _make_payload(self) -> dict:
+        st = self.msp.state
+        payload: dict = {}
+        # Position
+        if st.lat_deg is not None and st.lon_deg is not None:
+            payload['lat'] = float(st.lat_deg)
+            payload['lng'] = float(st.lon_deg)
+        # Altitude (fused)
+        if st.altitude_m is not None:
+            try:
+                payload['altitude'] = float(st.altitude_m)
+            except Exception:
+                pass
+        # Voltage (server can estimate % if no battery field)
+        if st.vbat_v is not None:
+            try:
+                payload['voltage'] = float(st.vbat_v)
+            except Exception:
+                pass
+        # Heading: prefer yaw, fallback to GPS course
+        hdg = None
+        try:
+            if st.yaw_deg is not None:
+                hdg = float(st.yaw_deg)
+            elif st.gps_course_deg is not None:
+                hdg = float(st.gps_course_deg)
+        except Exception:
+            hdg = None
+        if hdg is not None:
+            payload['heading'] = hdg
+        # Armed flag
+        try:
+            payload['armed'] = bool(self.msp._is_armed())
+        except Exception:
+            pass
+        # Mode (human-readable)
+        mode_str = None
+        if self.ap is not None:
+            try:
+                m = self.ap.mode
+                mode_map = {
+                    Autopilot.MODE_IDLE: 'IDLE',
+                    Autopilot.MODE_TAKEOFF: 'TAKEOFF',
+                    Autopilot.MODE_HOLD: 'HOLD',
+                    Autopilot.MODE_GOTO: 'GOTO',
+                    Autopilot.MODE_LAND: 'LAND',
+                }
+                mode_str = mode_map.get(m, 'UNKNOWN')
+            except Exception:
+                pass
+        if mode_str:
+            payload['mode'] = mode_str
+        # GPS summary
+        try:
+            payload['gps'] = { 'sats': int(st.gps_num_sat or 0), 'fix': 1 if st.gps_fix else 0 }
+        except Exception:
+            pass
+        return payload
+
+    def _send(self, data_dict: dict):
+        try:
+            data = json.dumps(data_dict).encode('utf-8')
+            req = urllib.request.Request(self.url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
+            with urllib.request.urlopen(req, timeout=0.3) as resp:
+                _ = resp.read(0)
+        except Exception:
+            # Silent failure to avoid spamming control loop output
+            pass
+
+    def _run(self):
+        while not self._stop:
+            now = time.time()
+            payload = self._make_payload()
+            if payload != self._last_payload or (now - self._last_sent) > 1.0:
+                self._send(payload)
+                self._last_payload = payload
+                self._last_sent = now
+            time.sleep(self.period)
+
+
+def start_api_server_background():
+    """Start the Flask API server in a background thread like remote_control.py."""
+    def _run():
+        try:
+            from api_server import app  # reuse the same app
+            print("[API] Starting Flask API on 0.0.0.0:5000 ...")
+            app.run(host='0.0.0.0', port=5000, threaded=True, debug=False, use_reloader=False)
+        except Exception as e:
+            print(f"[API] Server error: {e}")
+    thr = threading.Thread(target=_run, daemon=True)
+    thr.start()
+    return thr
+
+
+# ------------------------
 # CLI
 # ------------------------
 
@@ -1535,6 +1694,12 @@ def main():
         if args.hover_early_samples < 20:
             args.hover_early_samples = 20
 
+    # Start the local Web API in background for the UI
+    try:
+        start_api_server_background()
+    except Exception as e:
+        print(f"[MAIN] Could not start embedded API server: {e}")
+
     msp = MspClient(
         port=args.port,
         use_ultrasonic=not args.no_ultrasonic,
@@ -1593,6 +1758,7 @@ def main():
         hover_early_samples=int(args.hover_early_samples),
     )
 
+    telem_pub = None
     try:
         store_val = getattr(hover_store, 'base_hover_pwm', None)
         print(f"[MAIN] Hover model init: base={store_val if store_val is not None else 'None'} vref={hover_store.vcell_ref:.2f}V slope={hover_store.slope_pwm_per_v:.2f} pwm/V sample_count={hover_store.sample_count}")
@@ -1610,7 +1776,10 @@ def main():
     cmd_stop = threading.Event()
 
     try:
-        # Telemetry background thread (start early so we can observe calibration)
+        # Telemetry background thread (console) and HTTP publisher for Web UI
+        telem_pub = TelemetryPublisher(msp, ap, rate_hz=15)
+        telem_pub.start()
+        # Optional console telemetry (text)
         if args.telemetry or args.telemetry_rc or args.telemetry_hover:
             def _telem_loop():
                 while not telem_stop.is_set():
@@ -1804,6 +1973,11 @@ def main():
         except Exception as e:
             print(f"[MAIN] Disarm error: {e}")
     finally:
+        try:
+            if telem_pub is not None:
+                telem_pub.stop()
+        except Exception:
+            pass
         try:
             if telem_thread is not None:
                 telem_stop.set()
