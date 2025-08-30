@@ -19,9 +19,8 @@ except ImportError:
     print("Missing dependency: pyserial. Install with 'pip install pyserial'")
     raise
 
-# ------------------------
-# MSP Constants
-# ------------------------
+
+
 BAUD_RATE = 115200
 MSP_SET_RAW_RC = 200
 MSP_ALTITUDE = 109
@@ -34,46 +33,46 @@ PWM_MIN = 1000
 PWM_MAX = 2000
 PWM_MID = 1500
 
-AUX_ARM_CH = 4          # AUX1 index
+AUX_ARM_CH = 4          
 AUX_ARM_HIGH = 1800
 AUX_ARM_LOW = 1000
 
-THROTTLE_SAFETY_ARM_OFFSET = 50  # throttle must be <= (min + offset) to arm
+THROTTLE_SAFETY_ARM_OFFSET = 50  
 
-# Hover persistence defaults
+
 HOVER_PERSIST_DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".colibrix_hover.json")
 HOVER_MIN_PWM = PWM_MIN + 200
 HOVER_MAX_PWM = PWM_MAX - 200
-# ------------------------
-# Ultrasonic Fusion Config
-# ------------------------
-# Enable/disable ultrasonic fusion by default (can be overridden by CLI)
+
+
+
+
 ULTRA_DEFAULT_ENABLED = True
-# Valid measurement range (meters)
+
 ULTRA_MIN_VALID_M = 0.02
 ULTRA_MAX_VALID_M = 1.00
-ULTRA_SAT_EPS_M = 0.01  # consider ultrasonic saturated if within this of max
-# Blending region around the top end of ultrasonic range for smooth transition
-# w_ultra = 1 below BLEND_LOW, -> 0 as we approach ULTRA_MAX_VALID_M
+ULTRA_SAT_EPS_M = 0.01  
+
+
 ULTRA_BLEND_LOW_M = 0.80
 ULTRA_BLEND_HIGH_M = 1.20
-# Ground calibration: when ultrasonic < this, adapt baro bias toward ultrasonic
-ULTRA_GROUND_CALIB_M = 0.15
-# Smoothing factors
-FUSED_ALT_LPF_ALPHA = 0.10      # low-pass on fused altitude
-BARO_BIAS_ALPHA = 0.02          # slow adaptation of baro bias near ground
 
-# ------------------------
-# Data Models
-# ------------------------
+ULTRA_GROUND_CALIB_M = 0.15
+
+FUSED_ALT_LPF_ALPHA = 0.10      
+BARO_BIAS_ALPHA = 0.02          
+
+
+
+
 @dataclass
 class DroneState:
-    # Sensors
-    altitude_m: Optional[float] = None            # fused altitude (meters)
-    # Raw/aux signals
-    baro_alt_m_raw: Optional[float] = None        # raw from MSP_ALTITUDE (m)
-    baro_bias_m: float = 0.0                      # bias subtracted from raw
-    ultrasonic_alt_m: Optional[float] = None      # from ultrasonic (m)
+    
+    altitude_m: Optional[float] = None            
+    
+    baro_alt_m_raw: Optional[float] = None        
+    baro_bias_m: float = 0.0                      
+    ultrasonic_alt_m: Optional[float] = None      
     lat_deg: Optional[float] = None
     lon_deg: Optional[float] = None
     gps_fix: bool = False
@@ -84,33 +83,33 @@ class DroneState:
     pitch_deg: Optional[float] = None
     yaw_deg: Optional[float] = None
 
-    # Battery/Power
-    vbat_v: Optional[float] = None          # pack voltage (V)
-    amperage_a: Optional[float] = None      # current draw (A)
-    mah_drawn: int = 0                      # mAh consumed
+    
+    vbat_v: Optional[float] = None          
+    amperage_a: Optional[float] = None      
+    mah_drawn: int = 0                      
     last_battery_update: float = 0.0
-    # Battery configuration and derived
-    battery_cells_config: int = 0           # 0=auto detect by voltage
+    
+    battery_cells_config: int = 0           
     battery_low_cell_v: float = 3.55
     battery_crit_cell_v: float = 3.40
     battery_boot_cell_v: float = 3.50
-    battery_pct: Optional[float] = None     # 0..100 estimated from per-cell voltage
+    battery_pct: Optional[float] = None     
 
-    # Home
+    
     home_lat_deg: Optional[float] = None
     home_lon_deg: Optional[float] = None
     home_set: bool = False
 
-    # Timestamps
+    
     last_alt_update: float = 0.0
     last_ultra_update: float = 0.0
     last_gps_update: float = 0.0
     last_att_update: float = 0.0
 
-    # Internals
-    _altitude_m_prev: Optional[float] = None      # fused previous (for vspeed)
+    
+    _altitude_m_prev: Optional[float] = None      
     _altitude_vspeed_mps: float = 0.0
-    _altitude_lpf: Optional[float] = None         # fused LPF store
+    _altitude_lpf: Optional[float] = None         
 
     def update_altitude(self, alt_m: float):
         """Backward-compatible: treat as barometric update from MSP."""
@@ -118,35 +117,35 @@ class DroneState:
 
     def update_baro_alt(self, alt_m: float):
         now = time.time()
-        # store raw and corrected
+        
         self.baro_alt_m_raw = alt_m
         baro_corr = alt_m - self.baro_bias_m
-        # fuse with ultrasonic if available
+        
         fused = self._fuse_altitude(baro_corr, self.ultrasonic_alt_m)
         self._update_fused(fused, now)
 
     def update_ultrasonic(self, ultra_m: Optional[float]):
         now = time.time()
-        # sanitize ultrasonic reading
+        
         if ultra_m is not None and (ULTRA_MIN_VALID_M <= ultra_m <= ULTRA_MAX_VALID_M):
             self.ultrasonic_alt_m = float(ultra_m)
             self.last_ultra_update = now
-            # Opportunistic baro bias calibration near ground
+            
             if self.baro_alt_m_raw is not None and self.ultrasonic_alt_m < ULTRA_GROUND_CALIB_M:
                 target_bias = self.baro_alt_m_raw - self.ultrasonic_alt_m
-                # speed up bias convergence very close to ground where ultrasonic is reliable
+                
                 alpha = 0.15
                 self.baro_bias_m = (1.0 - alpha) * self.baro_bias_m + alpha * target_bias
         else:
-            # out of range -> ignore but still fuse using baro
+            
             self.ultrasonic_alt_m = None
-        # recompute fused using latest values
+        
         baro_corr = None if self.baro_alt_m_raw is None else (self.baro_alt_m_raw - self.baro_bias_m)
         fused = self._fuse_altitude(baro_corr, self.ultrasonic_alt_m)
         self._update_fused(fused, now)
 
     def _fuse_altitude(self, baro_corr: Optional[float], ultra: Optional[float]) -> Optional[float]:
-        # Choose sensor or blend with proper handling of ultrasonic saturation
+        
         if baro_corr is None and ultra is None:
             return None
         if ultra is None:
@@ -154,10 +153,10 @@ class DroneState:
         if baro_corr is None:
             return ultra
         u = float(ultra)
-        # Weight selection:
-        # - Fully trust ultrasonic very close to ground
-        # - If ultrasonic is saturated near its max, rely on baro only
-        # - Otherwise blend down from BLEND_LOW to upper (min of BLEND_HIGH and sensor max)
+        
+        
+        
+        
         if u <= ULTRA_GROUND_CALIB_M + 0.03:
             w_u = 1.0
         elif u >= ULTRA_MAX_VALID_M - ULTRA_SAT_EPS_M:
@@ -172,17 +171,17 @@ class DroneState:
 
     def _update_fused(self, fused: Optional[float], now: float):
         if fused is None:
-            # do not change altitude_m but update timestamp if we had any sensor update
+            
             self.last_alt_update = now
             return
-        # vertical speed from fused
+        
         if self._altitude_m_prev is not None:
             dt = max(1e-3, now - self.last_alt_update)
             vs = (fused - self._altitude_m_prev) / dt
             alpha_vs = 0.3
             self._altitude_vspeed_mps = (1 - alpha_vs) * self._altitude_vspeed_mps + alpha_vs * vs
         self._altitude_m_prev = fused
-        # low-pass fused altitude for stability
+        
         if self._altitude_lpf is None:
             self._altitude_lpf = fused
         else:
@@ -190,14 +189,14 @@ class DroneState:
         self.altitude_m = max(0.0, self._altitude_lpf)
         self.last_alt_update = now
 
-    # ---- Battery helpers ----
+    
     def get_cells(self) -> Optional[int]:
         """Return configured cell count if set, else a simple auto-detect from voltage."""
         if self.battery_cells_config and self.battery_cells_config > 0:
             return int(self.battery_cells_config)
         if self.vbat_v is None:
             return None
-        # Rough heuristic: divide by nominal 3.7 V/cell (clamped 2..12)
+        
         cells = int(round(self.vbat_v / 3.7))
         return max(2, min(12, max(1, cells)))
 
@@ -218,7 +217,7 @@ class DroneState:
                 self.mah_drawn = int(mah_drawn)
             except Exception:
                 pass
-        # Estimate percentage from per-cell voltage (linear 3.30..4.20 V)
+        
         if self.vbat_v is not None:
             cells = self.get_cells()
             if cells and cells > 0:
@@ -238,9 +237,9 @@ class DroneState:
             self.home_lon_deg = self.lon_deg
             self.home_set = True
 
-# ------------------------
-# Helpers
-# ------------------------
+
+
+
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -255,16 +254,16 @@ def meters_per_deg_lon(lat_deg: float) -> float:
 
 
 def bearing_deg(from_lat: float, from_lon: float, to_lat: float, to_lon: float) -> float:
-    # Bearing 0..360
+    
     y = math.sin(math.radians(to_lon - from_lon)) * math.cos(math.radians(to_lat))
     x = math.cos(math.radians(from_lat)) * math.sin(math.radians(to_lat)) - math.sin(math.radians(from_lat)) * math.cos(math.radians(to_lat)) * math.cos(math.radians(to_lon - from_lon))
     brng = math.degrees(math.atan2(y, x))
     return (brng + 360.0) % 360.0
 
 
-# ------------------------
-# Hover Persistence
-# ------------------------
+
+
+
 class HoverStore:
     def __init__(self, path: Optional[str] = None, enabled: bool = True,
                  baseline_hint: Optional[int] = None,
@@ -275,21 +274,21 @@ class HoverStore:
                  vcell_ref: Optional[float] = None):
         self.path = path or HOVER_PERSIST_DEFAULT_PATH
         self.enabled = bool(enabled)
-        # Learning settings
-        self.alpha = max(0.001, min(0.5, float(alpha)))  # EMA rate for base hover
+        
+        self.alpha = max(0.001, min(0.5, float(alpha)))  
         self.use_tilt_comp = bool(use_tilt_comp)
         self.use_vbat_comp = bool(use_vbat_comp)
-        # Model state (persisted)
-        self.base_hover_pwm: Optional[int] = None  # nominal hover at 0 deg tilt, mid battery
-        self.vcell_ref: float = 3.80               # reference per-cell voltage
-        self.slope_pwm_per_v: float = 0.0          # compensation slope per volt per cell
+        
+        self.base_hover_pwm: Optional[int] = None  
+        self.vcell_ref: float = 3.80               
+        self.slope_pwm_per_v: float = 0.0          
         self.sample_count: int = 0
-        # Back-compat single value
+        
         self.value: Optional[int] = None
-        # Runtime
+        
         self.last_save: float = 0.0
         self.version: int = 1
-        # Initialize
+        
         if not reset:
             self._load()
         if vcell_ref is not None:
@@ -298,7 +297,7 @@ class HoverStore:
             except Exception:
                 pass
         if self.base_hover_pwm is None:
-            # prefer hint if provided else fallback to old value or 1500
+            
             init = baseline_hint if baseline_hint is not None else (self.value if self.value is not None else 1500)
             self.base_hover_pwm = int(clamp(int(init), HOVER_MIN_PWM, HOVER_MAX_PWM))
 
@@ -308,12 +307,12 @@ class HoverStore:
         try:
             with open(self.path, 'r') as f:
                 data = json.load(f)
-            # Backward compat single value
+            
             if 'hover_pwm' in data and isinstance(data['hover_pwm'], (int, float)):
                 v = int(data['hover_pwm'])
                 if v > 0:
                     self.value = int(clamp(v, HOVER_MIN_PWM, HOVER_MAX_PWM))
-            # New model fields
+            
             self.version = int(data.get('version', 1))
             bh = data.get('base_hover_pwm')
             if isinstance(bh, (int, float)):
@@ -335,11 +334,11 @@ class HoverStore:
                 if isinstance(a, (int, float)):
                     self.alpha = max(0.001, min(0.5, float(a)))
         except Exception:
-            # ignore load errors
+            
             pass
 
     def get(self, default_pwm: int) -> int:
-        # Return base hover (no compensation), used for initialization
+        
         if self.enabled and (self.base_hover_pwm is not None):
             return int(self.base_hover_pwm)
         if self.enabled and (self.value is not None):
@@ -348,13 +347,13 @@ class HoverStore:
 
     def predict(self, tilt_deg: Optional[float], v_cell: Optional[float]) -> int:
         base = int(self.get(PWM_MID))
-        # Tilt compensation: divide by cos(tilt)
+        
         if self.use_tilt_comp and tilt_deg is not None:
             t = max(0.0, float(tilt_deg))
             c = math.cos(math.radians(min(60.0, t)))
-            c = max(0.6, c)  # avoid excessive boost
+            c = max(0.6, c)  
             base = int(round(base / c))
-        # Battery compensation around reference
+        
         if self.use_vbat_comp and v_cell is not None and abs(self.slope_pwm_per_v) > 1e-6:
             base = int(round(base + self.slope_pwm_per_v * (float(v_cell) - float(self.vcell_ref))))
         return int(clamp(base, HOVER_MIN_PWM, HOVER_MAX_PWM))
@@ -365,19 +364,19 @@ class HoverStore:
                            alpha_override: Optional[float] = None):
         if not self.enabled:
             return
-        # Bring required back to base (0 tilt, ref voltage)
+        
         base_est = int(clamp(required_hover_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
-        # Remove battery bias
+        
         if self.use_vbat_comp and v_cell is not None:
             dv = float(v_cell) - float(self.vcell_ref)
             base_est = int(round(base_est - self.slope_pwm_per_v * dv))
-        # Remove tilt effect
+        
         if self.use_tilt_comp and tilt_deg is not None:
             t = max(0.0, float(tilt_deg))
             c = math.cos(math.radians(min(60.0, t)))
             c = max(0.6, c)
             base_est = int(round(base_est * c))
-        # EMA update of base
+        
         a = self.alpha if alpha_override is None else max(0.001, min(0.5, float(alpha_override)))
         if self.base_hover_pwm is None:
             self.base_hover_pwm = base_est
@@ -385,17 +384,17 @@ class HoverStore:
             self.base_hover_pwm = int(round((1.0 - a) * self.base_hover_pwm + a * base_est))
         self.base_hover_pwm = int(clamp(self.base_hover_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
         self.sample_count += 1
-        # Gentle update of battery slope if voltage offset is significant
+        
         if self.use_vbat_comp and v_cell is not None:
             dv = float(v_cell) - float(self.vcell_ref)
             if abs(dv) > 0.03:
-                # target slope that would make base_est closer to base_hover
+                
                 err = float(self.base_hover_pwm) - float(base_est)
                 alpha_s = 0.02
                 self.slope_pwm_per_v = float(self.slope_pwm_per_v) + alpha_s * (err / dv)
-                # constrain slope to sane bounds
+                
                 self.slope_pwm_per_v = max(-200.0, min(200.0, self.slope_pwm_per_v))
-        # opportunistically save
+        
         now = time.time()
         if now - self.last_save > 1.0:
             self._save()
@@ -409,9 +408,9 @@ class HoverStore:
                 os.makedirs(ddir, exist_ok=True)
             payload = {
                 'version': self.version,
-                # Back-compat field
+                
                 'hover_pwm': int(self.base_hover_pwm or self.value or 0),
-                # Model
+                
                 'base_hover_pwm': int(self.base_hover_pwm or 0),
                 'vcell_ref': float(self.vcell_ref),
                 'slope_pwm_per_v': float(self.slope_pwm_per_v),
@@ -427,18 +426,18 @@ class HoverStore:
                 json.dump(payload, f)
             self.last_save = time.time()
         except Exception:
-            # ignore save errors
+            
             pass
 
     def reset_model(self, baseline_hint: Optional[int] = None, vcell_ref: Optional[float] = None, save: bool = True):
         """Reset the hover model in-memory to a baseline and optionally save to disk."""
-        # Choose baseline from hint, legacy value, or conservative default
+        
         base = baseline_hint if baseline_hint is not None else (self.value if self.value is not None else 1500)
         try:
             self.base_hover_pwm = int(clamp(int(base), HOVER_MIN_PWM, HOVER_MAX_PWM))
         except Exception:
             self.base_hover_pwm = int(clamp(1500, HOVER_MIN_PWM, HOVER_MAX_PWM))
-        # Reset compensation slope and counters
+        
         if vcell_ref is not None:
             try:
                 self.vcell_ref = float(vcell_ref)
@@ -446,7 +445,7 @@ class HoverStore:
                 pass
         self.slope_pwm_per_v = 0.0
         self.sample_count = 0
-        # Opportunistically save
+        
         if save:
             try:
                 self._save()
@@ -454,9 +453,9 @@ class HoverStore:
                 pass
 
 
-# ------------------------
-# MSP Client
-# ------------------------
+
+
+
 class MspClient:
     def __init__(self, port: Optional[str] = None, baud: int = BAUD_RATE,
                  use_ultrasonic: bool = ULTRA_DEFAULT_ENABLED,
@@ -471,9 +470,9 @@ class MspClient:
         self.state = DroneState()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # TX lock to avoid interleaved writes from multiple threads
+        
         self._tx_lock = threading.Lock()
-        # polling intervals (s)
+        
         self.alt_interval = 0.05
         self.gps_interval = 0.5
         self.att_interval = 0.05
@@ -484,29 +483,29 @@ class MspClient:
         self.analog_interval = 0.5
         self._last_analog_req = 0.0
         self._last_ultra_poll = 0.0
-        # RC state
+        
         self.rc_values: List[int] = [PWM_MID] * RC_CHANNELS_COUNT
-        self.rc_values[2] = PWM_MIN  # throttle low
-        self.rc_values[AUX_ARM_CH] = AUX_ARM_LOW  # disarmed
-        # lock for rc/state
+        self.rc_values[2] = PWM_MIN  
+        self.rc_values[AUX_ARM_CH] = AUX_ARM_LOW  
+        
         self._lock = threading.Lock()
-        # Ultrasonic
+        
         self._ultra: Optional[UltrasonicReader] = None
         self._ultra_enabled = use_ultrasonic
         self._ultra_trigger_pin = ultra_trigger_pin
         self._ultra_echo_pin = ultra_echo_pin
         self._ultra_max_distance_m = ultra_max_distance_m
-        # Debug and RX stats
+        
         self.debug = debug_msp
         self._rx_bad_checksum = 0
         self._got_first_alt = False
         self._got_first_analog = False
 
-    # ----- Serial -----
+    
     def _open_serial(self) -> serial.Serial:
         if self.port:
             return serial.Serial(self.port, self.baud, timeout=0)
-        # Try common ports
+        
         ports = [
             '/dev/ttyAMA0',
             '/dev/ttyS0',
@@ -524,7 +523,7 @@ class MspClient:
                 last_err = e
         raise RuntimeError(f"Unable to open serial port. Last error: {last_err}")
 
-    # ----- MSP framing -----
+    
     @staticmethod
     def _checksum(payload: bytes) -> int:
         chk = 0
@@ -550,12 +549,12 @@ class MspClient:
         self._send_msp(cmd, None)
 
     def _parse_rx(self):
-        # parse packets from _rx_buf
+        
         buf = self._rx_buf
         while True:
             idx = buf.find(b'$M>')
             if idx == -1:
-                # keep tail
+                
                 self._rx_buf = buf[-3:]
                 return
             if len(buf) < idx + 5:
@@ -569,10 +568,10 @@ class MspClient:
             payload = buf[idx + 5: idx + 5 + size]
             recv_chk = buf[idx + 5 + size]
             calc_chk = self._checksum(buf[idx + 3: idx + 5 + size])
-            # advance
+            
             buf = buf[idx + 6 + size:]
             if recv_chk != calc_chk:
-                # Drop corrupted packet and continue
+                
                 self._rx_bad_checksum += 1
                 if getattr(self, "debug", False) and (self._rx_bad_checksum % 50 == 1):
                     print(f"[MSP] Dropped packets due to checksum: {self._rx_bad_checksum}")
@@ -586,10 +585,10 @@ class MspClient:
             if cmd == MSP_ALTITUDE and len(payload) >= 4:
                 alt_cm = struct.unpack('<i', payload[0:4])[0]
                 alt_m = float(alt_cm) / 100.0
-                # If ultrasonic is unavailable, adapt baro bias while disarmed to peg ground at 0
+                
                 try:
                     if (self._ultra is None) and (not self._is_armed()):
-                        # Fast convergence on very first alt, then slow tracking
+                        
                         a = 0.20 if not self._got_first_alt else BARO_BIAS_ALPHA
                         self.state.baro_bias_m = (1.0 - a) * self.state.baro_bias_m + a * alt_m
                 except Exception:
@@ -610,7 +609,7 @@ class MspClient:
                     self.state.lat_deg = lat_e7 / 1e7
                     self.state.lon_deg = lon_e7 / 1e7
                     self.state.set_home_if_needed()
-                # altitude from GPS (fallback only)
+                
                 if self.state.altitude_m is None and alt_m != 0:
                     self.state.update_altitude(float(alt_m))
                 self.state.gps_speed_mps = max(0.0, speed_cms) / 100.0
@@ -622,15 +621,15 @@ class MspClient:
                 yaw = struct.unpack('<h', payload[4:6])[0] / 10.0
                 self.state.roll_deg = roll
                 self.state.pitch_deg = pitch
-                # Betaflight yaw often [-180,180]. Normalize 0..360 for convenience
+                
                 self.state.yaw_deg = (yaw + 360.0) % 360.0
                 self.state.last_att_update = time.time()
             elif cmd == MSP_ANALOG and len(payload) >= 1:
-                # MSPv1 ANALOG (legacy):
-                #  byte 0: vbat in 0.1V (uint8)
-                #  bytes 1-2: mAh drawn (uint16)
-                #  bytes 3-4: RSSI (uint16) [ignored]
-                #  bytes 5-6: amperage in 0.01A (int16) [optional]
+                
+                
+                
+                
+                
                 try:
                     vbat_dV = payload[0]
                     vbat_v = float(vbat_dV) / 10.0
@@ -652,11 +651,11 @@ class MspClient:
                 self.state.update_battery(vbat_v, amperage_a, mah)
                 self._got_first_analog = True
 
-    # ----- Lifecycle -----
+    
     def start(self):
         self.ser = self._open_serial()
         self._stop_evt.clear()
-        # Try to initialize ultrasonic reader (optional)
+        
         if self._ultra_enabled and self._ultra is None:
             try:
                 self._ultra = UltrasonicReader(trigger_pin=self._ultra_trigger_pin,
@@ -672,7 +671,7 @@ class MspClient:
     def _loop(self):
         while not self._stop_evt.is_set():
             now = time.time()
-            # Periodic requests
+            
             if now - self._last_alt_req > self.alt_interval:
                 self._request(MSP_ALTITUDE)
                 self._last_alt_req = now
@@ -682,11 +681,11 @@ class MspClient:
             if now - self._last_att_req > self.att_interval:
                 self._request(MSP_ATTITUDE)
                 self._last_att_req = now
-            # Battery/analog telemetry
+            
             if now - self._last_analog_req > self.analog_interval:
                 self._request(MSP_ANALOG)
                 self._last_analog_req = now
-            # Poll ultrasonic if available
+            
             if self._ultra is not None and (now - self._last_ultra_poll > self.ultra_interval):
                 try:
                     d = self._ultra.read_m()
@@ -694,7 +693,7 @@ class MspClient:
                     d = None
                 self.state.update_ultrasonic(d)
                 self._last_ultra_poll = now
-            # Read
+            
             try:
                 n = self.ser.in_waiting
                 if n > 0:
@@ -719,7 +718,7 @@ class MspClient:
             try:
                 if self.ser is not None:
                     try:
-                        # send a final neutral/disarm frame for safety
+                        
                         payload = b''.join(struct.pack('<H', PWM_MIN if i in (2, AUX_ARM_CH) else PWM_MID) for i in range(RC_CHANNELS_COUNT))
                         self._send_msp(MSP_SET_RAW_RC, payload)
                         time.sleep(0.05)
@@ -732,12 +731,12 @@ class MspClient:
             except Exception:
                 pass
 
-    # ----- RC -----
+    
     def send_rc(self, rc_values: List[int]):
-        # copy & clamp then send
+        
         with self._lock:
             vals = [int(clamp(v, PWM_MIN, PWM_MAX)) for v in rc_values[:RC_CHANNELS_COUNT]]
-            # keep array length consistent
+            
             if len(vals) < RC_CHANNELS_COUNT:
                 vals += [PWM_MIN] * (RC_CHANNELS_COUNT - len(vals))
             self.rc_values = list(vals)
@@ -758,9 +757,9 @@ class MspClient:
                 return False
 
 
-# ------------------------
-# Ultrasonic Reader (optional)
-# ------------------------
+
+
+
 class UltrasonicReader:
     """Lightweight wrapper for gpiozero.DistanceSensor.
 
@@ -769,29 +768,29 @@ class UltrasonicReader:
     """
     def __init__(self, trigger_pin: int, echo_pin: int, max_distance_m: float = 1.2):
         try:
-            from gpiozero import DistanceSensor  # type: ignore
+            from gpiozero import DistanceSensor  
         except Exception as e:
             raise RuntimeError("gpiozero not available") from e
         self._max_m = max(ULTRA_MAX_VALID_M, float(max_distance_m))
-        # gpiozero DistanceSensor.distance -> 0..1 proportion of max_distance
+        
         self._sensor = DistanceSensor(echo=echo_pin, trigger=trigger_pin, max_distance=self._max_m)
 
     def read_m(self) -> Optional[float]:
         try:
-            d_ratio = float(self._sensor.distance)  # 0..1 relative to max_distance
+            d_ratio = float(self._sensor.distance)  
         except Exception:
             return None
         d_m = d_ratio * self._max_m
-        # sanitize
+        
         if d_m <= 0.0 or d_m > (self._max_m + 0.2):
             return None
         return d_m
-    # (UltrasonicReader is polled by MspClient; no background thread here)
+    
 
 
-# ------------------------
-# Manual Controller (Gamepad override)
-# ------------------------
+
+
+
 class ManualController:
     """Gamepad-driven manual RC override, similar to remote_control.py.
 
@@ -801,15 +800,15 @@ class ManualController:
     - Gracefully disables itself if pygame or a gamepad is unavailable
     """
 
-    # Axis mapping (matches remote_control.py defaults)
-    AXIS_YAW = 0        # left stick X
-    AXIS_THROTTLE = 1   # left stick Y (inverted)
-    AXIS_ROLL = 3       # right stick X
-    AXIS_PITCH = 4      # right stick Y (inverted)
+    
+    AXIS_YAW = 0        
+    AXIS_THROTTLE = 1   
+    AXIS_ROLL = 3       
+    AXIS_PITCH = 4      
 
-    # Button mapping (common Xbox layout)
-    BUTTON_ARM_DISARM = 4  # LB / L1
-    BUTTON_ALTHOLD = 3     # Y / Triangle (hold)
+    
+    BUTTON_ARM_DISARM = 4  
+    BUTTON_ALTHOLD = 3     
 
     def __init__(self, deadzone: float = 0.08, yaw_locked: bool = False):
         self._dz = float(deadzone)
@@ -819,16 +818,16 @@ class ManualController:
         self._active = False
         self.yaw_locked = yaw_locked
 
-        # RC state (8 channels)
+        
         self._rc: List[int] = [PWM_MID] * RC_CHANNELS_COUNT
-        self._rc[2] = PWM_MIN  # throttle low
+        self._rc[2] = PWM_MIN  
         self._rc[AUX_ARM_CH] = AUX_ARM_LOW
         for i in range(5, RC_CHANNELS_COUNT):
-            self._rc[i] = PWM_MIN  # AUX low by default
+            self._rc[i] = PWM_MIN  
 
-        # pygame setup (lazy import to keep dependency optional)
+        
         try:
-            import pygame  # type: ignore
+            import pygame  
         except Exception as e:
             raise RuntimeError("pygame not available; manual controller disabled") from e
         self._pg = pygame
@@ -840,11 +839,11 @@ class ManualController:
         self._js.init()
         self._connected = True
 
-        # background thread
+        
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    # ----- Public API -----
+    
     def has_control(self) -> bool:
         """True when sticks are deflected (or throttle raised) and gamepad connected."""
         return self._connected and self._active
@@ -860,13 +859,13 @@ class ManualController:
         except Exception:
             pass
         try:
-            # Quit pygame subsystems if we started them
+            
             self._pg.joystick.quit()
             self._pg.quit()
         except Exception:
             pass
 
-    # ----- Internals -----
+    
     def _map_axis_to_rc(self, axis_value: float, min_rc: int = PWM_MIN, max_rc: int = PWM_MAX, inverted: bool = False) -> int:
         v = float(axis_value)
         if abs(v) < self._dz:
@@ -879,7 +878,7 @@ class ManualController:
     def _loop(self):
         try:
             while not self._stop_evt.is_set():
-                # process events
+                
                 for event in self._pg.event.get():
                     if event.type == self._pg.JOYAXISMOTION:
                         if event.axis == self.AXIS_YAW:
@@ -899,21 +898,21 @@ class ManualController:
                     elif event.type == self._pg.JOYBUTTONDOWN:
                         if event.button == self.BUTTON_ARM_DISARM:
                             with self._lock:
-                                # Disarm anytime; Arm only if throttle is low
+                                
                                 armed = self._rc[AUX_ARM_CH] >= (AUX_ARM_LOW + AUX_ARM_HIGH) // 2
                                 if armed:
-                                    # Always allow disarm and drop throttle to minimum for safety
+                                    
                                     self._rc[AUX_ARM_CH] = AUX_ARM_LOW
                                     self._rc[2] = PWM_MIN
                                 else:
-                                    # Require throttle low to arm
+                                    
                                     if self._rc[2] <= PWM_MIN + THROTTLE_SAFETY_ARM_OFFSET:
                                         self._rc[AUX_ARM_CH] = AUX_ARM_HIGH
                                     else:
                                         print("[MANUAL] Refuse arm: throttle too high")
                         elif event.button == self.BUTTON_ALTHOLD:
                             with self._lock:
-                                # AUX2 high while held
+                                
                                 if RC_CHANNELS_COUNT > 5:
                                     self._rc[5] = 1800
 
@@ -928,7 +927,7 @@ class ManualController:
                         self._active = False
 
                     elif event.type == self._pg.JOYDEVICEADDED:
-                        # try to reinit
+                        
                         try:
                             if self._pg.joystick.get_count() > 0:
                                 self._js = self._pg.joystick.Joystick(0)
@@ -937,12 +936,12 @@ class ManualController:
                         except Exception:
                             pass
 
-                # enforce yaw lock if enabled
+                
                 if self.yaw_locked:
                     with self._lock:
                         self._rc[3] = PWM_MID
 
-                # update active flag based on stick deflection
+                
                 with self._lock:
                     roll_dev = abs(self._rc[0] - PWM_MID) > 20
                     pitch_dev = abs(self._rc[1] - PWM_MID) > 20
@@ -957,9 +956,9 @@ class ManualController:
             self._active = False
 
 
-# ------------------------
-# Autopilot
-# ------------------------
+
+
+
 class Autopilot:
     MODE_IDLE = 0
     MODE_TAKEOFF = 1
@@ -972,7 +971,7 @@ class Autopilot:
                  max_tilt_deg: float = 25.0,
                  max_speed_mps: float = 5.0,
                  invert_roll: bool = False,
-                 invert_pitch: bool = True,  # match remote_control default feel
+                 invert_pitch: bool = True,  
                  manual: Optional[ManualController] = None,
                  hover_store: Optional[HoverStore] = None,
                  takeoff_boost_pwm: int = 80,
@@ -981,7 +980,7 @@ class Autopilot:
                  alt_kp: float = 20.0,
                  alt_ki: float = 2.0,
                  alt_pwm_max: int = 150,
-                 # Hover persistence and learning controls
+                 
                  hover_stable_alt_eps: float = 0.05,
                  hover_stable_vs_eps: float = 0.06,
                  hover_stable_tilt_deg: float = 10.0,
@@ -999,17 +998,17 @@ class Autopilot:
         self.manual = manual
         self.hover_store = hover_store
         self.hover_runtime_alpha = max(0.01, min(1.0, float(hover_runtime_alpha)))
-        # Sticky manual takeover flag: once True, autonomous stays disabled until restart
+        
         self.sticky_manual = False
 
-        # RC state
+        
         self.rc: List[int] = [PWM_MID] * RC_CHANNELS_COUNT
         self.rc[2] = PWM_MIN
         self.rc[AUX_ARM_CH] = AUX_ARM_LOW
         for i in range(5, RC_CHANNELS_COUNT):
             self.rc[i] = PWM_MIN
 
-        # control targets
+        
         self.mode = self.MODE_IDLE
         self.target_alt_m: Optional[float] = None
         self.target_yaw_deg: Optional[float] = None
@@ -1017,14 +1016,14 @@ class Autopilot:
         self.safe_alt_m: float = 10.0
         self.geofence_m: Optional[float] = None
 
-        # goto phase
-        self._goto_phase: int = 0  # 0=idle, 1=climb, 2=cruise, 3=descend, 4=done
+        
+        self._goto_phase: int = 0  
 
-        # landing detection helper
+        
         self._land_touchdown_start: Optional[float] = None
 
-        # altitude control
-        # initialize hover from store base (no comp)
+        
+        
         self.hover_pwm = 1500
         if self.hover_store is not None:
             try:
@@ -1034,18 +1033,18 @@ class Autopilot:
         self.alt_kp = float(alt_kp)
         self.alt_ki = float(alt_ki)
         self.alt_i = 0.0
-        self.alt_pwm_max = int(max(10, min(500, alt_pwm_max)))  # +/- around hover
-        # persistence helpers
+        self.alt_pwm_max = int(max(10, min(500, alt_pwm_max)))  
+        
         self._hover_stable_since: Optional[float] = None
         self._last_hover_persist: float = 0.0
-        # telemetry last values for hover estimator (for printing)
+        
         self.last_hover_pred: Optional[int] = None
         self.last_hover_cmd: Optional[int] = None
         self.last_hover_adjust: Optional[float] = None
         self.last_hover_err: Optional[float] = None
         self.last_hover_tilt: Optional[float] = None
         self.last_hover_vcell: Optional[float] = None
-        # hover persist/learn configuration
+        
         self.hover_stable_alt_eps = float(max(0.0, hover_stable_alt_eps))
         self.hover_stable_vs_eps = float(max(0.0, hover_stable_vs_eps))
         self.hover_stable_tilt_deg = float(max(0.0, hover_stable_tilt_deg))
@@ -1055,35 +1054,35 @@ class Autopilot:
         self.hover_early_alpha = float(max(0.001, min(0.5, hover_early_alpha)))
         self.hover_early_samples = int(max(0, hover_early_samples))
 
-        # takeoff boost
+        
         self.takeoff_boost_pwm = int(max(0, takeoff_boost_pwm))
         self.takeoff_boost_time = float(max(0.0, takeoff_boost_time))
         self._takeoff_boost_until: float = 0.0
 
-        # yaw control
-        self.yaw_kp = 2.0  # pwm per deg error (via 500/angle_limit scaling)
+        
+        self.yaw_kp = 2.0  
 
-        # battery states
+        
         self._batt_saver = False
         self._batt_forced_land = False
         self._last_batt_log = 0.0
 
-        # position control
-        self.pos_kp_deg_per_m = 0.8  # deg tilt per meter error
-        self.vel_kd_deg_per_mps = 0.2  # deg per m/s damping
+        
+        self.pos_kp_deg_per_m = 0.8  
+        self.vel_kd_deg_per_mps = 0.2  
 
-        # execution
+        
         self._stop_evt = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    # ----- Public API -----
+    
     def arm(self) -> bool:
-        # safety: throttle low
+        
         self.rc[2] = PWM_MIN
         self.msp.send_rc(self.rc)
         time.sleep(0.1)
-        # require safety threshold
+        
         if self.rc[2] > PWM_MIN + THROTTLE_SAFETY_ARM_OFFSET:
             print("[AP] Refusing to arm: throttle too high")
             return False
@@ -1102,11 +1101,11 @@ class Autopilot:
         self.target_alt_m = max(0.5, alt_m)
         self.mode = self.MODE_TAKEOFF
         print(f"[AP] Takeoff to {self.target_alt_m:.2f} m")
-        # arm takeoff boost window
+        
         self._takeoff_boost_until = time.time() + self.takeoff_boost_time
 
     def hold(self, use_pos: bool = True):
-        # lock current altitude and position
+        
         st = self.msp.state
         if st.altitude_m is not None:
             self.target_alt_m = st.altitude_m
@@ -1134,18 +1133,18 @@ class Autopilot:
         self.mode = self.MODE_LAND
         print("[AP] Land engaged")
 
-    # ----- Internals -----
+    
     def _loop(self):
-        # RC send rate
+        
         last_send = 0.0
         send_interval = 1.0 / 50.0
         while not self._stop_evt.is_set():
             st = self.msp.state
-            # Manual override: sticky manual pass-through matching remote_control.py
+            
             if self.manual is not None:
-                # Snapshot current manual RC
+                
                 man = self.manual.get_rc()
-                # Engage sticky on first detected manual control OR AUX change (e.g., arming/althold)
+                
                 if not self.sticky_manual:
                     aux_changed = any(abs((man[i] if i < len(man) else PWM_MIN) - PWM_MIN) > 30 for i in range(4, RC_CHANNELS_COUNT))
                     if aux_changed or self.manual.has_control():
@@ -1153,7 +1152,7 @@ class Autopilot:
                         self.mode = self.MODE_IDLE
                         print("[AP] Manual takeover engaged: RC pass-through active; autonomous disabled until restart")
                 if self.sticky_manual:
-                    # Pass through all channels, including AUX
+                    
                     self.rc = [int(clamp(v, PWM_MIN, PWM_MAX)) for v in man[:RC_CHANNELS_COUNT]]
                     now = time.time()
                     if now - last_send >= send_interval:
@@ -1162,17 +1161,17 @@ class Autopilot:
                     time.sleep(0.01)
                     continue
 
-            # default neutral
+            
             roll_cmd = PWM_MID
             pitch_cmd = PWM_MID
             yaw_cmd = PWM_MID
             thr_cmd = self.rc[2]
 
-            # heading target default
+            
             if self.target_yaw_deg is None and st.yaw_deg is not None:
                 self.target_yaw_deg = st.yaw_deg
 
-            # Battery monitoring and actions
+            
             vb = st.vbat_v
             cells = st.get_cells()
             if vb is not None and cells is not None and cells > 0:
@@ -1196,37 +1195,37 @@ class Autopilot:
                     print(f"[AP][BAT] {vb:.2f} V ({v_cell:.2f} V/cell, cells={cells}, {pct_s})")
                     self._last_batt_log = nowb
 
-            # mode logic
+            
             if self.mode == self.MODE_IDLE:
-                # keep throttle low, neutral sticks
+                
                 thr_cmd = PWM_MIN
                 roll_cmd = PWM_MID
                 pitch_cmd = PWM_MID
                 yaw_cmd = PWM_MID
 
             elif self.mode == self.MODE_TAKEOFF:
-                # hold yaw, neutral roll/pitch
+                
                 yaw_cmd = self._yaw_hold_cmd(st)
                 roll_cmd = PWM_MID
                 pitch_cmd = PWM_MID
-                # altitude control to climb to target
+                
                 thr_cmd = self._altitude_cmd(st)
-                # initial boost to ensure prompt liftoff before fused altitude stabilizes
+                
                 nowt = time.time()
                 if nowt < self._takeoff_boost_until:
                     low_alt = (st.altitude_m is None) or (st.altitude_m < 0.15)
                     if low_alt and self.takeoff_boost_pwm > 0:
                         thr_cmd = max(thr_cmd, int(clamp(self.hover_pwm + self.takeoff_boost_pwm, PWM_MIN, PWM_MAX)))
-                # transition when reached
+                
                 if st.altitude_m is not None and self.target_alt_m is not None:
                     if st.altitude_m >= self.target_alt_m - 0.1:
                         self.hold(use_pos=False)
 
             elif self.mode == self.MODE_HOLD:
                 yaw_cmd = self._yaw_hold_cmd(st)
-                # altitude hold
+                
                 thr_cmd = self._altitude_cmd(st)
-                # optional position hold
+                
                 if self.target_latlon and st.gps_fix and st.lat_deg is not None and st.lon_deg is not None:
                     roll_cmd, pitch_cmd = self._position_cmd(st, self.target_latlon)
                 else:
@@ -1235,7 +1234,7 @@ class Autopilot:
 
             elif self.mode == self.MODE_GOTO:
                 yaw_cmd = self._yaw_hold_cmd(st)
-                # enforce geofence
+                
                 if self._violates_geofence(st):
                     print("[AP] Geofence breached, switching to HOLD")
                     self.hold(use_pos=True)
@@ -1243,10 +1242,10 @@ class Autopilot:
                     print("[AP] No GPS fix/pos, switching to HOLD")
                     self.hold(use_pos=False)
                 else:
-                    # phases
+                    
                     cur_alt = st.altitude_m if st.altitude_m is not None else 0.0
                     if self._goto_phase == 1:
-                        # climb to safe altitude
+                        
                         self.target_alt_m = self.safe_alt_m
                         thr_cmd = self._altitude_cmd(st)
                         roll_cmd = PWM_MID
@@ -1254,15 +1253,15 @@ class Autopilot:
                         if cur_alt >= self.safe_alt_m - 0.2:
                             self._goto_phase = 2
                     elif self._goto_phase == 2:
-                        # cruise horizontally, hold at safe_alt
+                        
                         self.target_alt_m = self.safe_alt_m
                         thr_cmd = self._altitude_cmd(st)
                         roll_cmd, pitch_cmd = self._position_cmd(st, self.target_latlon)
-                        # check proximity to target
+                        
                         if self._distance_to_target_m(st, self.target_latlon) < 2.0:
                             self._goto_phase = 3
                     elif self._goto_phase == 3:
-                        # descend to target_alt and hold position
+                        
                         self.target_alt_m = max(0.5, self.target_alt_m or 1.0)
                         thr_cmd = self._altitude_cmd(st)
                         roll_cmd, pitch_cmd = self._position_cmd(st, self.target_latlon)
@@ -1275,23 +1274,23 @@ class Autopilot:
 
             elif self.mode == self.MODE_LAND:
                 yaw_cmd = self._yaw_hold_cmd(st)
-                # gentle descend toward 0 m
+                
                 self.target_alt_m = 0.0
-                # If we have any altitude estimate, use controller; otherwise slowly reduce throttle
+                
                 if (st.altitude_m is not None) or (st.ultrasonic_alt_m is not None):
                     thr_cmd = self._altitude_cmd(st, landing=True)
                 else:
                     thr_cmd = max(PWM_MIN, self.rc[2] - 5)
                 roll_cmd = PWM_MID
                 pitch_cmd = PWM_MID
-                # touchdown detection with dwell to avoid premature disarm
+                
                 touch = False
                 if st.ultrasonic_alt_m is not None:
-                    # rely on ultrasonic very close to ground (<12 cm)
+                    
                     if st.ultrasonic_alt_m < 0.12:
                         touch = True
                 elif st.altitude_m is not None:
-                    # fallback: fused altitude extremely low and vertical speed near 0
+                    
                     if st.altitude_m < 0.08 and abs(st._altitude_vspeed_mps) < 0.05:
                         touch = True
                 now_t = time.time()
@@ -1300,7 +1299,7 @@ class Autopilot:
                         self._land_touchdown_start = now_t
                         print("[AP] Touchdown detected, confirming...")
                     elif (now_t - self._land_touchdown_start) > 0.8:
-                        # confirmed landed -> cut throttle and disarm
+                        
                         self.rc[2] = PWM_MIN
                         self.msp.send_rc(self._compose_rc(PWM_MID, PWM_MID, PWM_MIN, PWM_MID))
                         time.sleep(0.2)
@@ -1311,7 +1310,7 @@ class Autopilot:
                 else:
                     self._land_touchdown_start = None
 
-            # update rc & send
+            
             self.rc = self._compose_rc(roll_cmd, pitch_cmd, thr_cmd, yaw_cmd)
             now = time.time()
             if now - last_send >= send_interval:
@@ -1324,21 +1323,21 @@ class Autopilot:
         self._stop_evt.set()
         self._thread.join(timeout=1.0)
 
-    # ----- Controllers -----
+    
     def _compose_rc(self, roll: int, pitch: int, thr: int, yaw: int) -> List[int]:
         rc = list(self.rc)
         rc[0] = int(clamp(roll, PWM_MIN, PWM_MAX))
         rc[1] = int(clamp(pitch, PWM_MIN, PWM_MAX))
         rc[2] = int(clamp(thr, PWM_MIN, PWM_MAX))
         rc[3] = int(clamp(yaw, PWM_MIN, PWM_MAX))
-        # keep AUX the same
+        
         return rc
 
     def _altitude_cmd(self, st: DroneState, landing: bool = False) -> int:
-        # If no altitude, hold last throttle (or hover)
+        
         if st.altitude_m is None or self.target_alt_m is None:
             return int(clamp(self.hover_pwm, PWM_MIN, PWM_MAX))
-        # compute current tilt and vcell
+        
         tilt = None
         if st.roll_deg is not None and st.pitch_deg is not None:
             try:
@@ -1351,19 +1350,19 @@ class Autopilot:
             if cells and cells > 0:
                 v_cell = st.vbat_v / float(cells)
         err = self.target_alt_m - st.altitude_m
-        # record for telemetry
+        
         self.last_hover_tilt = tilt
         self.last_hover_vcell = v_cell
         self.last_hover_err = float(err)
-        # integral with anti-windup
+        
         self.alt_i = clamp(self.alt_i + err * 0.01, -100.0, 100.0)
         adjust = self.alt_kp * err + self.alt_ki * self.alt_i
         adjust = clamp(adjust, -self.alt_pwm_max, self.alt_pwm_max)
-        # landing bias to ensure descent
+        
         if landing:
             adjust = clamp(adjust - 50, -self.alt_pwm_max, self.alt_pwm_max)
         self.last_hover_adjust = float(adjust)
-        # Predict baseline hover (feedforward) and adapt quickly toward it
+        
         if self.hover_store is not None:
             try:
                 pred = self.hover_store.predict(tilt, v_cell)
@@ -1372,10 +1371,10 @@ class Autopilot:
                 self.hover_pwm = int(clamp(self.hover_pwm, HOVER_MIN_PWM, HOVER_MAX_PWM))
             except Exception:
                 pass
-        # Compose final throttle
+        
         cmd = int(clamp(self.hover_pwm + adjust, PWM_MIN, PWM_MAX))
         self.last_hover_cmd = int(cmd)
-        # Learn/persist hover when stable (not during landing)
+        
         if not landing:
             self._maybe_persist_hover(st, err, tilt=tilt, v_cell=v_cell, cmd=cmd, adjust=adjust)
         return cmd
@@ -1386,7 +1385,7 @@ class Autopilot:
         if st.altitude_m is None or self.target_alt_m is None:
             self._hover_stable_since = None
             return
-        # stability conditions
+        
         stable_alt = abs(err) < self.hover_stable_alt_eps
         stable_vs = abs(st._altitude_vspeed_mps) < self.hover_stable_vs_eps
         stable_tilt = (tilt is None) or (abs(tilt) < self.hover_stable_tilt_deg)
@@ -1395,11 +1394,11 @@ class Autopilot:
             now = time.time()
             if self._hover_stable_since is None:
                 self._hover_stable_since = now
-            # persist after stability dwell and respecting persist interval
+            
             if (now - self._hover_stable_since) > self.hover_stable_dwell_s and (now - self._last_hover_persist) > self.hover_persist_interval_s:
-                # required hover is close to base = cmd - adjust
+                
                 req_hover = int(clamp(cmd - adjust, HOVER_MIN_PWM, HOVER_MAX_PWM))
-                # speed up early learning
+                
                 a_override = self.hover_early_alpha if getattr(self.hover_store, 'sample_count', 0) < self.hover_early_samples else None
                 self.hover_store.update_observation(req_hover, tilt, v_cell, alpha_override=a_override)
                 self._last_hover_persist = now
@@ -1411,12 +1410,12 @@ class Autopilot:
             return PWM_MID
         if self.target_yaw_deg is None:
             self.target_yaw_deg = st.yaw_deg
-        # shortest error (-180..180)
+        
         err = (self.target_yaw_deg - st.yaw_deg + 540.0) % 360.0 - 180.0
-        # map error deg -> angle fraction -> rc
-        # We use fraction of angle_limit for proportional yaw; small gain
+        
+        
         frac = clamp(err / self.angle_limit_deg, -1.0, 1.0)
-        pwm = int(PWM_MID + 500.0 * self.yaw_kp * frac / 10.0)  # divide to keep modest
+        pwm = int(PWM_MID + 500.0 * self.yaw_kp * frac / 10.0)  
         return int(clamp(pwm, PWM_MIN, PWM_MAX))
 
     def _position_cmd(self, st: DroneState, tgt: Tuple[float, float]) -> Tuple[int, int]:
@@ -1424,20 +1423,20 @@ class Autopilot:
         tlat, tlon = tgt
         if lat is None or lon is None:
             return PWM_MID, PWM_MID
-        # position error in N/E meters
+        
         m_per_lat = meters_per_deg_lat(lat)
         m_per_lon = meters_per_deg_lon(lat)
         dN = (tlat - lat) * m_per_lat
         dE = (tlon - lon) * m_per_lon
-        # velocity estimate from GPS
+        
         v = st.gps_speed_mps
         bearing = math.radians(st.gps_course_deg if st.gps_course_deg is not None else 0.0)
         vN = v * math.cos(bearing)
         vE = v * math.sin(bearing)
-        # desired tilt in deg (north->pitch, east->roll)
+        
         pitch_deg = clamp(-self.pos_kp_deg_per_m * dN - self.vel_kd_deg_per_mps * vN, -self.max_tilt_deg, self.max_tilt_deg)
         roll_deg = clamp(+self.pos_kp_deg_per_m * dE + self.vel_kd_deg_per_mps * vE, -self.max_tilt_deg, self.max_tilt_deg)
-        # map to RC
+        
         roll_rc = self._angle_to_rc(roll_deg, invert=self.invert_roll)
         pitch_rc = self._angle_to_rc(pitch_deg, invert=self.invert_pitch)
         return roll_rc, pitch_rc
@@ -1467,9 +1466,9 @@ class Autopilot:
         return dist > self.geofence_m
 
 
-# ------------------------
-# Web API integration (same pattern as remote_control.py)
-# ------------------------
+
+
+
 
 class TelemetryPublisher:
     """Publishes telemetry to the local API server for SSE streaming to the UI.
@@ -1507,23 +1506,23 @@ class TelemetryPublisher:
     def _make_payload(self) -> dict:
         st = self.msp.state
         payload: dict = {}
-        # Position
+        
         if st.lat_deg is not None and st.lon_deg is not None:
             payload['lat'] = float(st.lat_deg)
             payload['lng'] = float(st.lon_deg)
-        # Altitude (fused)
+        
         if st.altitude_m is not None:
             try:
                 payload['altitude'] = float(st.altitude_m)
             except Exception:
                 pass
-        # Voltage (server can estimate % if no battery field)
+        
         if st.vbat_v is not None:
             try:
                 payload['voltage'] = float(st.vbat_v)
             except Exception:
                 pass
-        # Heading: prefer yaw, fallback to GPS course
+        
         hdg = None
         try:
             if st.yaw_deg is not None:
@@ -1534,12 +1533,12 @@ class TelemetryPublisher:
             hdg = None
         if hdg is not None:
             payload['heading'] = hdg
-        # Armed flag
+        
         try:
             payload['armed'] = bool(self.msp._is_armed())
         except Exception:
             pass
-        # Mode (human-readable)
+        
         mode_str = None
         if self.ap is not None:
             try:
@@ -1556,7 +1555,7 @@ class TelemetryPublisher:
                 pass
         if mode_str:
             payload['mode'] = mode_str
-        # GPS summary
+        
         try:
             payload['gps'] = { 'sats': int(st.gps_num_sat or 0), 'fix': 1 if st.gps_fix else 0 }
         except Exception:
@@ -1570,7 +1569,7 @@ class TelemetryPublisher:
             with urllib.request.urlopen(req, timeout=0.3) as resp:
                 _ = resp.read(0)
         except Exception:
-            # Silent failure to avoid spamming control loop output
+            
             pass
 
     def _run(self):
@@ -1588,7 +1587,7 @@ def start_api_server_background():
     """Start the Flask API server in a background thread like remote_control.py."""
     def _run():
         try:
-            from api_server import app  # reuse the same app
+            from api_server import app  
             print("[API] Starting Flask API on 0.0.0.0:5000 ...")
             app.run(host='0.0.0.0', port=5000, threaded=True, debug=False, use_reloader=False)
         except Exception as e:
@@ -1598,9 +1597,7 @@ def start_api_server_background():
     return thr
 
 
-# ------------------------
-# CLI
-# ------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(description="Autonomous controller over MSP (Betaflight Angle mode)")
@@ -1622,24 +1619,24 @@ def main():
     parser.add_argument('--alt-pwm-max', type=int, default=150, help='Max absolute PWM adjustment around hover for altitude hold')
     parser.add_argument('--invert-roll', action='store_true', default=True, help='Invert roll command mapping')
     parser.add_argument('--invert-pitch', action='store_true', help='Invert pitch command mapping')
-    # Ultrasonic options
+    
     parser.add_argument('--no-ultrasonic', action='store_true', help='Disable ultrasonic altitude fusion')
     parser.add_argument('--ultra-trigger', type=int, default=23, help='Ultrasonic trigger pin (BCM)')
     parser.add_argument('--ultra-echo', type=int, default=24, help='Ultrasonic echo pin (BCM)')
     parser.add_argument('--ultra-max', type=float, default=1.0, help='Ultrasonic max distance (m)')
-    # Manual control options
+    
     parser.add_argument('--no-manual', action='store_true', help='Disable gamepad manual override')
-    # Telemetry options
+    
     parser.add_argument('--telemetry', action='store_true', help='Print live telemetry (altitude, vspeed, battery)')
     parser.add_argument('--telemetry-rc', action='store_true', help='Print live RC values sent to FC (roll, pitch, throttle, yaw, AUX)')
     parser.add_argument('--telemetry-hover', action='store_true', help='Print hover estimator telemetry (pred/base/slope/vref/tilt/vcell/err/adjust/cmd)')
     parser.add_argument('--debug-msp', action='store_true', help='Verbose MSP debug (checksum drops, first samples)')
-    # Hover persistence and takeoff boost
+    
     parser.add_argument('--no-hover-persist', action='store_true', help='Disable saving/loading learned hover throttle')
     parser.add_argument('--hover-file', type=str, default=HOVER_PERSIST_DEFAULT_PATH, help='Path to store learned hover throttle (JSON)')
     parser.add_argument('--takeoff-boost', type=int, default=80, help='Extra PWM added above hover during initial takeoff window')
     parser.add_argument('--takeoff-boost-time', type=float, default=1, help='Duration (s) to apply takeoff boost window')
-    # Hover model controls
+    
     parser.add_argument('--hover-baseline', type=int, default=1500, help='Baseline hover PWM hint (e.g., 1500)')
     parser.add_argument('--hover-reset', action='store_true', help='Reset stored hover model on startup')
     parser.add_argument('--hover-alpha', type=float, default=0.08, help='Learning rate (EMA) for base hover model (0.001..0.5)')
@@ -1647,7 +1644,7 @@ def main():
     parser.add_argument('--hover-no-tilt', action='store_true', help='Disable tilt compensation in hover model')
     parser.add_argument('--hover-no-vbat', action='store_true', help='Disable per-cell voltage compensation in hover model')
     parser.add_argument('--hover-runtime-alpha', type=float, default=0.35, help='Runtime blend toward predicted hover (0..1)')
-    # Hover fast adaptation preset and granular controls
+    
     parser.add_argument('--hover-fast-tune', action='store_true', help='Enable fast hover adaptation preset (overrides conservative defaults)')
     parser.add_argument('--hover-stable-alt-eps', type=float, default=0.05, help='Altitude error threshold (m) to consider stable for persistence')
     parser.add_argument('--hover-stable-vs-eps', type=float, default=0.06, help='Vertical speed threshold (m/s) to consider stable for persistence')
@@ -1657,26 +1654,26 @@ def main():
     parser.add_argument('--hover-stable-dwell', type=float, default=0.8, help='Minimum stability dwell time (s) before persisting')
     parser.add_argument('--hover-early-alpha', type=float, default=0.20, help='Temporary higher learning rate used for first N samples')
     parser.add_argument('--hover-early-samples', type=int, default=10, help='Number of early samples to use hover-early-alpha')
-    # Battery options
+    
     parser.add_argument('--cells', type=int, default=0, help='Battery cell count (0=auto)')
     parser.add_argument('--low-cell-v', type=float, default=3.55, help='Low-voltage threshold per cell (V) to enable saver mode')
     parser.add_argument('--crit-cell-v', type=float, default=3.40, help='Critical-voltage threshold per cell (V) to force landing')
     parser.add_argument('--boot-cell-v', type=float, default=3.50, help='Minimum per-cell voltage (V) required at startup; below this blocks startup')
     parser.add_argument('--skip-batt-check', action='store_true', help='Skip startup battery voltage check')
-    # Calibration option
+    
     parser.add_argument('--no-calibration', action='store_true', help='Skip startup calibration wait')
 
     args = parser.parse_args()
 
-    # Apply fast-tune preset if requested (choose aggressive but safe values)
+    
     if args.hover_fast_tune:
-        # Blend more aggressively toward predicted hover
+        
         if args.hover_runtime_alpha < 0.6:
             args.hover_runtime_alpha = 0.6
-        # Learn base faster
+        
         if args.hover_alpha < 0.20:
             args.hover_alpha = 0.20
-        # Loosen stability gates and persist more frequently
+        
         if args.hover_stable_alt_eps < 0.10:
             args.hover_stable_alt_eps = 0.10
         if args.hover_stable_vs_eps < 0.12:
@@ -1694,7 +1691,7 @@ def main():
         if args.hover_early_samples < 20:
             args.hover_early_samples = 20
 
-    # Start the local Web API in background for the UI
+    
     try:
         start_api_server_background()
     except Exception as e:
@@ -1739,7 +1736,7 @@ def main():
         max_tilt_deg=args.max_tilt,
         max_speed_mps=args.max_speed,
         invert_roll=args.invert_roll,
-        invert_pitch=args.invert_pitch or True,  # default True to match remote_control feel
+        invert_pitch=args.invert_pitch or True,  
         manual=manual,
         hover_store=hover_store,
         takeoff_boost_pwm=int(args.takeoff_boost),
@@ -1768,18 +1765,18 @@ def main():
     except Exception:
         pass
 
-    # Telemetry helpers
+    
     telem_thread = None
     telem_stop = threading.Event()
-    # Command console (stdin) helpers
+    
     cmd_thread = None
     cmd_stop = threading.Event()
 
     try:
-        # Telemetry background thread (console) and HTTP publisher for Web UI
+        
         telem_pub = TelemetryPublisher(msp, ap, rate_hz=15)
         telem_pub.start()
-        # Optional console telemetry (text)
+        
         if args.telemetry or args.telemetry_rc or args.telemetry_hover:
             def _telem_loop():
                 while not telem_stop.is_set():
@@ -1803,7 +1800,7 @@ def main():
                         print(f"[TEL] baro={_fmt(br)} bias={bias:.2f} ultra={_fmt(ul)} fused={_fmt(fu)} vs={vs:.2f} | batt={_fmt(vb)}V cell={_fmt(vcell)}V cells={cells_s} {pct_s} I={_fmt(amp)}A mAh={mah}")
                     if args.telemetry_rc:
                         rc = msp.get_rc()
-                        # Ensure len 8
+                        
                         rc = (rc + [PWM_MIN] * RC_CHANNELS_COUNT)[:RC_CHANNELS_COUNT]
                         r, p, t, y = rc[0], rc[1], rc[2], rc[3]
                         aux1 = rc[AUX_ARM_CH] if len(rc) > AUX_ARM_CH else PWM_MIN
@@ -1841,7 +1838,7 @@ def main():
                 modes.append("HOVER")
             print(f"[MAIN] Telemetry enabled: {', '.join(modes)}")
 
-        # Start command console (stdin) to allow runtime commands (e.g., hover reset)
+        
         def _cmd_loop():
             while not cmd_stop.is_set():
                 try:
@@ -1880,13 +1877,13 @@ def main():
         cmd_thread.start()
         print("[MAIN] Command console ready. Type 'help' for commands.")
 
-        # Calibration (default): wait a couple seconds for sensors/bias to settle
+        
         if not args.no_calibration:
             wait_s = 2.0
             print(f"[MAIN] Calibration: waiting {wait_s:.1f}s for sensors to settle (use --no-calibration to skip)")
             t0 = time.time()
             while (time.time() - t0) < wait_s:
-                # Actively request early samples for baro and battery
+                
                 try:
                     if not getattr(msp, '_got_first_alt', False):
                         msp._request(MSP_ALTITUDE)
@@ -1896,10 +1893,10 @@ def main():
                     pass
                 time.sleep(0.1)
         else:
-            # Minimal warm-up when skipping calibration
+            
             time.sleep(0.2)
 
-        # Apply battery configuration and perform startup check
+        
         st = msp.state
         try:
             st.battery_cells_config = max(0, int(args.cells))
@@ -1909,12 +1906,12 @@ def main():
         st.battery_crit_cell_v = float(args.crit_cell_v)
         st.battery_boot_cell_v = float(args.boot_cell_v)
         if not args.skip_batt_check:
-            # Wait for battery telemetry to arrive (actively request ANALOG)
+            
             wait_s = 5.0
             t0 = time.time()
             while st.vbat_v is None and (time.time() - t0) < wait_s:
                 try:
-                    # Proactively request analog to speed up first sample
+                    
                     msp._request(MSP_ANALOG)
                 except Exception:
                     pass
@@ -1927,7 +1924,7 @@ def main():
                 v_cell = vb / cells
                 if v_cell < st.battery_boot_cell_v:
                     print(f"[MAIN][BAT] Startup blocked: {v_cell:.2f} V/cell < boot {st.battery_boot_cell_v:.2f} V (pack {vb:.2f} V, cells={cells}). Use --skip-batt-check to override.")
-                    # Ensure disarmed state
+                    
                     try:
                         ap.disarm()
                     except Exception:
@@ -1936,11 +1933,11 @@ def main():
                 else:
                     print(f"[MAIN][BAT] Battery OK for startup: {vb:.2f} V ({v_cell:.2f} V/cell, cells={cells})")
 
-        # Commands
+        
         if args.arm:
             ap.arm()
             time.sleep(0.2)
-        # Auto-arm for flight-related commands
+        
         if (args.takeoff is not None) or args.hold or (args.goto is not None):
             ap.arm()
             time.sleep(0.2)
@@ -1957,14 +1954,14 @@ def main():
         if args.disarm:
             ap.disarm()
 
-        # Keep running until user interrupts
+        
         print("[MAIN] Running. Press Ctrl+C to exit.")
         while True:
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n[MAIN] EMERGENCY DISARM (Ctrl+C)...")
         try:
-            # Send multiple disarm frames to ensure FC receives it
+            
             ap.disarm()
             time.sleep(0.1)
             ap.disarm()
@@ -2006,7 +2003,6 @@ def main():
                 manual.stop()
         except Exception:
             pass
-
 
 if __name__ == '__main__':
     main()
